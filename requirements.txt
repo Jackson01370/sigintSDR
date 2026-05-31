@@ -1,0 +1,7 @@
+# pip で入れるもの
+numpy>=1.24
+matplotlib>=3.6      # スペクトログラムPNG保存に使用（任意・--save-spectrograms 時のみ必須）
+
+# --- 実機(HackRF)を使う場合は SoapySDR を dnf で導入（pip ではない）---
+# sudo dnf install python3-soapysdr SoapySDR SoapySDR-devel
+# SoapyHackRF のビルドは README 参照
