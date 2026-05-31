@@ -41,6 +41,8 @@ def main():
                    help="自己収集: 検出信号をSigMF形式でDIRに保存(自動ラベル付き)")
     p.add_argument("--collect-snr", type=float, default=8.0,
                    help="収集するSNR下限dB(既定8)")
+    p.add_argument("--collect-dedup-window", type=float, default=30.0,
+                   metavar="SEC", help="収集側の近接重複排除の時間窓(秒, 既定30, 0で無効)")
     p.add_argument("--db", default="sigscan.db", help="SQLiteログのパス")
 
     p.add_argument("--lna", type=float, default=24.0)
@@ -68,14 +70,16 @@ def main():
     store = Store(args.db)
     sched = HybridScheduler(backend, cfg, store,
                             collect_dir=args.collect,
-                            collect_snr_min=args.collect_snr)
+                            collect_snr_min=args.collect_snr,
+                            collect_dedup_s=args.collect_dedup_window)
     if args.collect:
         print(f"収集モード: SigMF を {args.collect}/ に保存 (SNR>={args.collect_snr}dB)")
     try:
         sched.run(once=args.once, verbose=not args.quiet)
     finally:
         if args.collect:
-            print(f"収集件数: {sched._collected}")
+            print(f"収集件数: {sched._collected}  "
+                  f"(重複スキップ: {sched._skipped_dup})")
         store.close()
         backend.close()
 

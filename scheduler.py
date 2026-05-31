@@ -21,13 +21,19 @@ import spec
 
 class HybridScheduler:
     def __init__(self, backend: SDRBackend, cfg: Config, store: Store | None = None,
-                 collect_dir: str | None = None, collect_snr_min: float = 8.0):
+                 collect_dir: str | None = None, collect_snr_min: float = 8.0,
+                 collect_dedup_s: float = 30.0):
         self.be = backend
         self.cfg = cfg
         self.store = store
         self.collect_dir = collect_dir
         self.collect_snr_min = collect_snr_min
+        # 収集側の重複排除: この秒数の窓で近接周波数を既収集ならスキップ
+        # (0 以下で無効化)。_build_targets の近接排除を収集ループにも広げる。
+        self.collect_dedup_s = collect_dedup_s
+        self._recent_collect: list[dict] = []   # 直近に収集した {center, bw, t}
         self._collected = 0
+        self._skipped_dup = 0
         # データ出所を正直に記録（合成と実測を後で混ぜないため）
         self._hw = ("HackRF One" if type(backend).__name__ == "HackRFBackend"
                     else "sigscan-sim (synthetic)")
@@ -80,6 +86,25 @@ class HybridScheduler:
 
         return targets[: sc.max_dwell_per_cycle]
 
+    # --- 収集側の重複排除 ---
+    def _recently_collected(self, center_hz: float, bw: float) -> bool:
+        """短時間窓で近接中心周波数を既に収集済みなら True。
+
+        _build_targets の近接判定（abs(Δ) < max(bw, 1e6)）を収集ループにも
+        適用する。サイクルをまたいでも、collect_dedup_s 窓の間は同一帯を
+        重複収集しない。窓は新旧どちらの帯域幅も跨がない大きさを採る。
+        """
+        if self.collect_dedup_s <= 0:
+            return False
+        now = time.time()
+        # 期限切れの記録を間引く
+        self._recent_collect = [r for r in self._recent_collect
+                                if now - r["t"] <= self.collect_dedup_s]
+        for r in self._recent_collect:
+            if abs(r["center"] - center_hz) < max(bw, r["bw"], 1e6):
+                return True
+        return False
+
     # --- ドウェル ---
     def dwell(self, target: dict) -> tuple[dict, classify.ClassResult]:
         c = self.cfg
@@ -106,17 +131,23 @@ class HybridScheduler:
 
         # 自己収集: 自動ラベル付きで SigMF 保存（track a の土台）
         if self.collect_dir and m["snr_db"] >= self.collect_snr_min:
-            ann = sigmf_io.annotation_from_result(m, result)
-            name = f"{int(round(center_hz/1e6))}MHz_{int(time.time()*1000)}_{self._collected}"
-            sigmf_io.write_recording(
-                os.path.join(self.collect_dir, name),
-                iq, center_hz, c.sdr.dwell_rate_hz,
-                annotations=[ann], hw=self._hw,
-                description=f"sigscan auto-collect; rep={spec.SIGSCAN_REP_VERSION}",
-                extra_global={"sigscan:rep_version": spec.SIGSCAN_REP_VERSION,
-                              "sigscan:target_src": target.get("src", "")},
-            )
-            self._collected += 1
+            if self._recently_collected(center_hz, m["bw_hz"]):
+                # 短時間窓で近接帯を既収集 → 重複としてスキップ（ログは残す）
+                self._skipped_dup += 1
+            else:
+                ann = sigmf_io.annotation_from_result(m, result)
+                name = f"{int(round(center_hz/1e6))}MHz_{int(time.time()*1000)}_{self._collected}"
+                sigmf_io.write_recording(
+                    os.path.join(self.collect_dir, name),
+                    iq, center_hz, c.sdr.dwell_rate_hz,
+                    annotations=[ann], hw=self._hw,
+                    description=f"sigscan auto-collect; rep={spec.SIGSCAN_REP_VERSION}",
+                    extra_global={"sigscan:rep_version": spec.SIGSCAN_REP_VERSION,
+                                  "sigscan:target_src": target.get("src", "")},
+                )
+                self._collected += 1
+                self._recent_collect.append(
+                    dict(center=center_hz, bw=m["bw_hz"], t=time.time()))
 
         return m, result
 
