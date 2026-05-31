@@ -135,6 +135,34 @@ python3 main.py --hardware --start 5.7e9 --stop 5.9e9   # 5.8GHz帯
 
 ---
 
+## テスト / CI
+
+凍結した契約（`spec.py` / `sigmf_io.py`）と6つの継ぎ目を回帰テストでロックしている。
+テストは `tests/` 配下にあり、契約のロジックは変更せず **振る舞いとシグネチャだけを固定**する。
+
+```bash
+pip install numpy pytest
+pytest -q                       # 全テスト実行
+pytest -q tests/test_spec.py    # ファイル個別
+python -m py_compile *.py       # 構文チェック（CI と同じ）
+```
+
+| テスト | 対象継ぎ目 | 何をロックするか |
+|--------|-----------|------------------|
+| `test_spec.py`      | 表現        | `render()` の shape/dtype/値域、`spec_summary()` をスナップショット固定 |
+| `test_sigmf_io.py`  | 交換        | IQ 往復一致、`core:datatype=cf32_le`/sample_rate/hw、annotation の周波数エッジ＆`sigscan:*` |
+| `test_classify.py`  | 分類        | 代表バンドのルール分類、CNN/LLM 未実装時のルール劣化 |
+| `test_dsp.py`       | 測定        | `detect_segments` の帯検出、`measure_signal` の bw/SNR |
+| `test_scheduler.py` | 取得・蓄積  | `SimBackend` で1サイクル(once)、`collect_dir` への自動ラベル付き SigMF 出力 |
+| `test_seams.py`     | 全6継ぎ目   | `inspect.signature` で各 API の引数名を凍結 |
+
+`spec_summary()` を変えると `test_spec.py` が落ちる（= 表現仕様の無断変更検知）。
+表現を意図的に変えたときは、SigMF の生IQから再レンダの上で
+`tests/snapshots/spec_summary.json` を更新すること。
+
+CI（`.github/workflows/ci.yml`）は Python 3.12 で `pip install` → `python -m py_compile *.py`
+→ `pytest -q` を実行する。
+
 ## ロードマップ（次の増分）
 
 1. **CNN学習パイプライン** — `--save-spectrograms` で集めた画像 + 合成データで
