@@ -15,7 +15,7 @@ import time
 import numpy as np
 
 from config import SDRConfig
-from dsp import welch_psd
+from dsp import welch_psd, remove_dc
 
 
 class SDRBackend:
@@ -62,7 +62,8 @@ def _default_sim_signals(rng: np.random.Generator) -> list[_SimSignal]:
 
 class SimBackend(SDRBackend):
     def __init__(self, cfg: SDRConfig, seed: int | None = 0,
-                 burst_per_capture: bool = False, dc_offset: float = 0.0):
+                 burst_per_capture: bool = False, dc_offset: float = 0.0,
+                 dc_removal: bool = False):
         self.cfg = cfg
         self.rng = np.random.default_rng(seed)
         self.signals = _default_sim_signals(self.rng)
@@ -77,6 +78,10 @@ class SimBackend(SDRBackend):
         # ドウェルIQの中央に現れる。既定 0（従来挙動）。品質ゲートの DCスパイク
         # 除外を main.py 経由で確認するためのもの。
         self.dc_offset = float(dc_offset)
+        # DC除去（DCオフセット補正）。合成は元々DCが無いので既定オフ。診断用に
+        # dc_offset を注入したとき、これを True にすると取得IQの平均を引いて中央
+        # スパイクが消える（= 他のSDRソフト同様の DC offset correction の確認）。
+        self.dc_removal = bool(dc_removal)
 
     def _refresh_activity(self):
         for s in self.signals:
@@ -135,6 +140,9 @@ class SimBackend(SDRBackend):
         if self.dc_offset:
             # 中央(DC, オフセット0Hz)固定・時間不変の細い線 = DCスパイク擬似。
             iq = iq + np.complex64(self.dc_offset)
+        if self.dc_removal:
+            # 実機の HackRFBackend と同じく受信入口で DC オフセットを除去する。
+            iq = remove_dc(iq)
         time.sleep(0.001)
         return iq
 
@@ -143,8 +151,14 @@ class SimBackend(SDRBackend):
 # HackRF 実機（SoapySDR）
 # ===========================================================================
 class HackRFBackend(SDRBackend):
-    def __init__(self, cfg: SDRConfig, device_args: str = "driver=hackrf"):
+    def __init__(self, cfg: SDRConfig, device_args: str = "driver=hackrf",
+                 dc_removal: bool | None = None):
         self.cfg = cfg
+        # DC除去（DCオフセット補正）。明示指定が無ければ cfg.dc_removal（実機既定
+        # 有効）に従う。受信入口の _read で適用するため、capture_iq（ドウェル）も
+        # sweep_power（サーベイ）も DC 除去済みの IQ を見る。
+        self.dc_removal = (bool(cfg.dc_removal) if dc_removal is None
+                           else bool(dc_removal))
         import SoapySDR                      # 遅延 import
         from SoapySDR import SOAPY_SDR_RX, SOAPY_SDR_CF32  # noqa
         self._S = SoapySDR
@@ -192,7 +206,12 @@ class HackRFBackend(SDRBackend):
                 break
         self.dev.deactivateStream(st)
         self.dev.closeStream(st)
-        return buff[:got] if got else buff
+        out = buff[:got] if got else buff
+        if self.dc_removal:
+            # 受信の最も入口で DC オフセットを除去（取得帯域中央のDCスパイクを消す）。
+            # 以降の全処理（サーベイ/ドウェル/測定/画像化/保存）が DC 除去済みを見る。
+            out = remove_dc(out)
+        return out
 
     def sweep_power(self, start_hz, stop_hz, bin_hz):
         """リチューン・ループで広帯域スペクトルを合成（ステップ幅=瞬時帯域）。

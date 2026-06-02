@@ -31,13 +31,20 @@ def build_backend(args, cfg, dwell_mode: bool = False):
         cfg.sdr.lna_gain = args.lna
         cfg.sdr.vga_gain = args.vga
         cfg.sdr.amp_on = args.amp
-        return HackRFBackend(cfg.sdr)
+        # 実機は既定で DC 除去を有効化（--no-dc-removal で無効化）。
+        cfg.sdr.dc_removal = not args.no_dc_removal
+        return HackRFBackend(cfg.sdr, dc_removal=cfg.sdr.dc_removal)
     from sdr import SimBackend
     # 滞在観測モードの sim では存在を取得毎に再抽選し、バースト挙動を擬似する
     # （合成なので限定的だが、持続率が 0〜1 で変化し品質ゲートの経路が通る）。
     dc = getattr(args, "sim_dc_spike", None)
+    # 合成は元々DCが無いので DC 除去は既定オフ。--dc-removal で強制有効化できる
+    # （--sim-dc-spike で注入した中央スパイクが消えることの診断用）。--no-dc-removal
+    # が指定されればそちらを優先（常に無効）。
+    sim_dc_removal = bool(args.dc_removal) and not args.no_dc_removal
     return SimBackend(cfg.sdr, seed=args.seed, burst_per_capture=dwell_mode,
-                      dc_offset=(dc if dc is not None else 0.0))
+                      dc_offset=(dc if dc is not None else 0.0),
+                      dc_removal=sim_dc_removal)
 
 
 def main():
@@ -82,6 +89,13 @@ def main():
                    help="DCスパイク判定: 中央集中のdBが観測間でこのdB以下なら時間不変")
     p.add_argument("--no-quality-gate", action="store_true",
                    help="品質ゲートを無効化（足切りせず全件保存）")
+
+    # --- DCスパイク除去（DCオフセット補正 / DC offset correction）---
+    p.add_argument("--no-dc-removal", action="store_true",
+                   help="DCスパイク除去(DCオフセット補正)を無効化。実機では既定で有効")
+    p.add_argument("--dc-removal", action="store_true",
+                   help="DC除去を強制有効化（Sim診断用: --sim-dc-spike で注入した中央"
+                        "スパイクが除去されることの確認。実機は既定で有効）")
 
     p.add_argument("--lna", type=float, default=24.0)
     p.add_argument("--vga", type=float, default=20.0)
@@ -131,6 +145,8 @@ def main():
           f"range={cfg.scan.start_hz/1e9:.2f}-{cfg.scan.stop_hz/1e9:.2f}GHz")
 
     backend = build_backend(args, cfg, dwell_mode=dwell_mode)
+    dc_state = "有効" if getattr(backend, "dc_removal", False) else "無効"
+    print(f"DCスパイク除去(DCオフセット補正): {dc_state}")
     store = Store(args.db)
     sched = HybridScheduler(backend, cfg, store,
                             collect_dir=args.collect,

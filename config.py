@@ -26,6 +26,14 @@ class SDRConfig:
     # SoapySDR リチューン後の整定待ち（秒）。PLL ロック待ち。
     retune_settle_s: float = 0.015
 
+    # DCスパイク除去（DCオフセット補正 / DC offset correction）。受信の最も入口で
+    #   複素IQの平均(複素DCオフセット)を引き、取得帯域の中央(オフセット0Hz)に出る
+    #   ゼロIF受信機由来の時間不変スパイク(DCスパイク)を消す。捨てるのではなく信号
+    #   から除く方式（他のSDRソフトと同様）。実機(HackRF)では既定で有効。CLI から
+    #   --no-dc-removal で無効化できる。合成(Sim)は元々DCが無いので Backend 側で
+    #   既定オフ（診断用 --sim-dc-spike で注入したものを --dc-removal で消せる）。
+    dc_removal: bool = True
+
 
 # ---------------------------------------------------------------------------
 # スキャン制御パラメータ

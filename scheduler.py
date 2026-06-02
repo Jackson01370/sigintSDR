@@ -42,6 +42,9 @@ class HybridScheduler:
         # データ出所を正直に記録（合成と実測を後で混ぜないため）
         self._hw = ("HackRF One" if type(backend).__name__ == "HackRFBackend"
                     else "sigscan-sim (synthetic)")
+        # 受信入口で DC オフセット補正(DCスパイク除去)を適用したか。保存する SigMF の
+        # global に sigscan:dc_removed として正直に記録する（後で再レンダ/学習時に判別可）。
+        self._dc_removed = bool(getattr(backend, "dc_removal", False))
         self._last_survey = 0.0
         self._segments: list[dict] = []
         # ホットバンドを優先度の重み付きで巡回するためのイテレータ
@@ -148,7 +151,8 @@ class HybridScheduler:
                     annotations=[ann], hw=self._hw,
                     description=f"sigscan auto-collect; rep={spec.SIGSCAN_REP_VERSION}",
                     extra_global={"sigscan:rep_version": spec.SIGSCAN_REP_VERSION,
-                                  "sigscan:target_src": target.get("src", "")},
+                                  "sigscan:target_src": target.get("src", ""),
+                                  "sigscan:dc_removed": self._dc_removed},
                 )
                 self._collected += 1
                 self._recent_collect.append(
@@ -169,7 +173,8 @@ class HybridScheduler:
             description=f"sigscan dwell-collect; rep={spec.SIGSCAN_REP_VERSION}",
             extra_global={"sigscan:rep_version": spec.SIGSCAN_REP_VERSION,
                           "sigscan:target_src": target.get("src", ""),
-                          "sigscan:capture_mode": "dwell"},
+                          "sigscan:capture_mode": "dwell",
+                          "sigscan:dc_removed": self._dc_removed},
         )
         # 凍結 write_recording は annotation の任意キーを通さないため、書き出し後に
         # 品質メタ（sigscan:）を annotation へ最小限 patch する（生IQには触れない）。
