@@ -17,17 +17,22 @@ import dsp
 import classify
 import sigmf_io
 import spec
+import dwell
+import quality
 
 
 class HybridScheduler:
     def __init__(self, backend: SDRBackend, cfg: Config, store: Store | None = None,
                  collect_dir: str | None = None, collect_snr_min: float = 8.0,
-                 collect_dedup_s: float = 30.0):
+                 collect_dedup_s: float = 30.0, dwell_mode: bool = False):
         self.be = backend
         self.cfg = cfg
         self.store = store
         self.collect_dir = collect_dir
         self.collect_snr_min = collect_snr_min
+        # 滞在観測モード（既定 off）。on だと各対象に滞在し反復観測 → 品質ゲートで
+        # 選別して保存する。off は従来どおり1回ドウェルの収集経路。
+        self.dwell_mode = dwell_mode
         # 収集側の重複排除: この秒数の窓で近接周波数を既収集ならスキップ
         # (0 以下で無効化)。_build_targets の近接排除を収集ループにも広げる。
         self.collect_dedup_s = collect_dedup_s
@@ -151,6 +156,103 @@ class HybridScheduler:
 
         return m, result
 
+    # --- 滞在観測モード ---
+    def _save_dwell(self, obs, m: dict, verdict, result, target: dict) -> None:
+        """品質ゲートを通った滞在観測を SigMF 保存し、品質メタを annotation に記録。"""
+        ann = sigmf_io.annotation_from_result(m, result)
+        name = (f"{int(round(obs.center_hz/1e6))}MHz_"
+                f"{int(time.time()*1000)}_{self._collected}")
+        base = os.path.join(self.collect_dir, name)
+        sigmf_io.write_recording(
+            base, obs.best_iq, obs.center_hz, self.cfg.sdr.dwell_rate_hz,
+            annotations=[ann], hw=self._hw,
+            description=f"sigscan dwell-collect; rep={spec.SIGSCAN_REP_VERSION}",
+            extra_global={"sigscan:rep_version": spec.SIGSCAN_REP_VERSION,
+                          "sigscan:target_src": target.get("src", ""),
+                          "sigscan:capture_mode": "dwell"},
+        )
+        # 凍結 write_recording は annotation の任意キーを通さないため、書き出し後に
+        # 品質メタ（sigscan:）を annotation へ最小限 patch する（生IQには触れない）。
+        quality.add_quality_to_meta(
+            base, quality.quality_annotation_meta(obs, verdict))
+        self._collected += 1
+        self._recent_collect.append(
+            dict(center=obs.center_hz, bw=m["bw_hz"], t=time.time()))
+
+    def dwell_observe_cycle(self) -> list[dict]:
+        """滞在観測モードの1サイクル。
+
+        各ターゲットに滞在観測 → クロスターゲットのコムスプリアス判定 → 品質ゲート
+        → 合格かつ収集条件を満たすものだけ SigMF 保存。検出ログ(store)は全件残す。
+        returns: 各ターゲットの {obs, m, result, verdict, saved} のリスト。
+        """
+        c = self.cfg
+        targets = self._build_targets()
+        observed: list[tuple[dict, "dwell.DwellObservation"]] = []
+        for t in targets:
+            obs = dwell.observe_dwell(
+                self.be, t["center"], c.sdr.dwell_rate_hz, c.sdr.dwell_samples,
+                c.dwell, c.quality, target_src=t.get("src", ""))
+            observed.append((t, obs))
+
+        # 「極細」判定に使う帯域幅: 検出帯はサーベイ実測(detect_segments)が堅牢。
+        # 帯域を埋める/CW の信号で measure_signal の bw が当てにならない場合に効く。
+        def _bw_eff(t, obs):
+            if t.get("src") == "detected" and t.get("bw", 0.0) > 0:
+                return float(t["bw"])
+            return obs.bw_median_hz
+        bw_eff = [_bw_eff(t, obs) for t, obs in observed]
+
+        comb = quality.flag_comb_spurs([o for _, o in observed], c.quality,
+                                       bw_list=bw_eff)
+
+        outcomes: list[dict] = []
+        for idx, ((t, obs), is_comb) in enumerate(zip(observed, comb)):
+            verdict = quality.evaluate_quality(obs, c.quality, comb_spur=is_comb,
+                                               bw_hz=bw_eff[idx])
+
+            # 代表測定。検出帯はサーベイ側の帯域幅/SNR を信頼（既存挙動踏襲）。
+            m = dict(obs.best)
+            if t.get("src") == "detected":
+                if t.get("bw", 0.0) > m["bw_hz"]:
+                    m["bw_hz"] = float(t["bw"])
+                m["snr_db"] = max(m["snr_db"], float(t.get("snr", 0.0)))
+
+            result = classify.classify(m, c.bands)
+            if self.store:
+                self.store.log(m, result)
+
+            saved = False
+            if (self.collect_dir and verdict.passed
+                    and m["snr_db"] >= self.collect_snr_min):
+                if self._recently_collected(obs.center_hz, m["bw_hz"]):
+                    self._skipped_dup += 1
+                else:
+                    self._save_dwell(obs, m, verdict, result, t)
+                    saved = True
+
+            outcomes.append(dict(obs=obs, m=m, result=result,
+                                 verdict=verdict, saved=saved))
+        return outcomes
+
+    def _print_dwell(self, o: dict) -> None:
+        """滞在観測1件の要約を表示（合格は SAVE、破棄は理由を併記）。"""
+        obs, m, r, v = o["obs"], o["m"], o["result"], o["verdict"]
+        if obs.snr_max_db < 5 and not o["saved"]:
+            return  # 何も無かった帯は静かに飛ばす
+        if o["saved"]:
+            tag = "SAVE"
+        elif v.passed:
+            tag = "pass"          # 合格だが収集条件外（SNR下限/重複）
+        else:
+            tag = "drop:" + ",".join(v.reasons)
+        print(f"  [{obs.target_src:>16}] "
+              f"{obs.center_hz/1e6:8.2f}MHz  "
+              f"BW={m['bw_hz']/1e6:5.1f}MHz  "
+              f"SNRmax={obs.snr_max_db:4.0f}dB  "
+              f"persist={obs.persistence:4.2f}({obs.n_detect}/{obs.n_obs})  "
+              f"→ {r.label}  [{tag}]")
+
     # --- メインループ ---
     def run(self, once: bool = False, verbose: bool = True):
         sc = self.cfg.scan
@@ -164,16 +266,21 @@ class HybridScheduler:
                                          f"{s['bw_hz']/1e6:.1f}MHz/{s['snr_db']:.0f}dB"
                                          for s in segs[:6]))
 
-                for t in self._build_targets():
-                    m, r = self.dwell(t)
-                    if self.store:
-                        self.store.log(m, r)
-                    if verbose and m["snr_db"] >= 5:
-                        print(f"  [{t['src']:>16}] "
-                              f"{m['center_hz']/1e6:8.2f}MHz  "
-                              f"BW={m['bw_hz']/1e6:5.1f}MHz  "
-                              f"SNR={m['snr_db']:4.0f}dB  "
-                              f"→ {r.label} ({r.confidence:.2f}/{r.method})")
+                if self.dwell_mode:
+                    for o in self.dwell_observe_cycle():
+                        if verbose:
+                            self._print_dwell(o)
+                else:
+                    for t in self._build_targets():
+                        m, r = self.dwell(t)
+                        if self.store:
+                            self.store.log(m, r)
+                        if verbose and m["snr_db"] >= 5:
+                            print(f"  [{t['src']:>16}] "
+                                  f"{m['center_hz']/1e6:8.2f}MHz  "
+                                  f"BW={m['bw_hz']/1e6:5.1f}MHz  "
+                                  f"SNR={m['snr_db']:4.0f}dB  "
+                                  f"→ {r.label} ({r.confidence:.2f}/{r.method})")
 
                 if once:
                     break

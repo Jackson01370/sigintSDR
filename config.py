@@ -56,6 +56,54 @@ class ScanConfig:
 
 
 # ---------------------------------------------------------------------------
+# 滞在観測（dwell 観測の長時間化）
+#   1つの対象周波数に一定時間留まり、IQ を複数回取得してバーストを待ち受ける。
+#   2.4GHz の WiFi/BT は数秒おきに一瞬しか出ないため、約13msの単発観測では
+#   取り逃す。滞在して反復観測することで「持続性」を測れるようにする。
+# ---------------------------------------------------------------------------
+@dataclass
+class DwellConfig:
+    # 各対象帯に滞在する秒数（スイープ全体ではなく1帯あたり）。
+    dwell_seconds: float = 10.0
+    # 滞在中の観測の間隔（秒）。バーストを跨いで待ち受けるため間を空ける。
+    obs_interval_s: float = 0.5
+    # 滞在中の最低観測回数（持続率の母数を確保。短い滞在でも下限を保証）。
+    min_observations: int = 4
+    # 暴走防止の観測回数上限（dwell_seconds が長くても打ち切る）。
+    max_observations: int = 80
+
+
+# ---------------------------------------------------------------------------
+# 品質ゲート（保存条件）— 既定は「厳しめ」に倒す（量より質）
+#   低品質・断片的なキャプチャを土台にすると学習の基準が崩れる。一瞬かすった
+#   だけの単発や受信機由来スプリアスは保存しない。しきい値はすべてここで調整可。
+# ---------------------------------------------------------------------------
+@dataclass
+class QualityConfig:
+    enabled: bool = True
+    # 1観測で「はっきり検出」とみなす SNR 下限(dB)。収集の足切りより厳しめ。
+    detect_snr_db: float = 10.0
+    # 持続性: 滞在中にこの回数以上はっきり検出され、かつ持続率がこれ以上。
+    #   一瞬かすっただけの単発（detections 不足/低持続率）は破棄する。
+    min_detections: int = 3
+    min_persistence: float = 0.34
+    # 極細スプリアス対策: 占有帯域がこれ未満を「極細」とみなす。
+    #   ただし幅だけで切らず、下の steady 判定（同一強度で居座る）と併用して、
+    #   バースト性のある正規の狭帯域信号(BLE等)を誤って捨てない。
+    narrow_bw_hz: float = 0.7e6
+    # 「同一強度で居座る」判定: SNR のばらつきがこれ以下（ほぼ一定）かつ
+    #   持続率がこれ以上（ほぼ常時）なら、受信機内部スプリアスを疑う。
+    #   narrow_bw と組み合わさったときのみ破棄する（広帯域の常時信号は正規）。
+    spur_snr_std_max: float = 1.5
+    spur_persistence_min: float = 0.9
+    # クロスターゲットのコムスプリアス検出（等間隔・同一強度の細いピーク列）。
+    #   アンテナ無しでも出る固定パターン＝複数帯にまたがる等間隔・同強度ピーク。
+    comb_spacing_tol_hz: float = 0.15e6   # 隣接間隔の一致許容
+    comb_power_tol_db: float = 2.0        # ピーク強度の一致許容
+    comb_min_run: int = 3                 # この本数以上並んだら全て破棄
+
+
+# ---------------------------------------------------------------------------
 # バンドプラン（1〜6GHz・日本の割当を考慮）
 #   priority: 大きいほどドウェル頻度を上げる
 #   hint    : ルールベース分類のヒント
@@ -107,4 +155,6 @@ BAND_PLAN: list[Band] = [
 class Config:
     sdr: SDRConfig = field(default_factory=SDRConfig)
     scan: ScanConfig = field(default_factory=ScanConfig)
+    dwell: DwellConfig = field(default_factory=DwellConfig)
+    quality: QualityConfig = field(default_factory=QualityConfig)
     bands: list[Band] = field(default_factory=lambda: list(BAND_PLAN))

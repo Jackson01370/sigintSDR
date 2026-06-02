@@ -61,11 +61,16 @@ def _default_sim_signals(rng: np.random.Generator) -> list[_SimSignal]:
 
 
 class SimBackend(SDRBackend):
-    def __init__(self, cfg: SDRConfig, seed: int | None = 0):
+    def __init__(self, cfg: SDRConfig, seed: int | None = 0,
+                 burst_per_capture: bool = False):
         self.cfg = cfg
         self.rng = np.random.default_rng(seed)
         self.signals = _default_sim_signals(self.rng)
         self.noise_dbm = -45.0  # 任意基準のノイズ床（相対値）
+        # 既定では存在状態の更新はサーベイ毎（=ドウェル中は固定）。滞在観測モードで
+        # バースト挙動を擬似したいとき True にすると、capture_iq 毎に存在を再抽選し、
+        # 同一帯でも観測ごとに出たり消えたりする（→ 持続率が 0〜1 で変化）。
+        self.burst_per_capture = burst_per_capture
 
     def _refresh_activity(self):
         for s in self.signals:
@@ -93,6 +98,9 @@ class SimBackend(SDRBackend):
         return freqs, power
 
     def capture_iq(self, center_hz, rate, n) -> np.ndarray:
+        if self.burst_per_capture:
+            # 滞在観測の各取得で存在を再抽選 → バースト的な出現/消失を擬似。
+            self._refresh_activity()
         t = np.arange(n) / rate
         # 基準ノイズ（複素ガウシアン）
         amp_noise = 10 ** (self.noise_dbm / 20.0)

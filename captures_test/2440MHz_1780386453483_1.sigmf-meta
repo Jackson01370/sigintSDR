@@ -1,0 +1,33 @@
+{
+  "global": {
+    "core:datatype": "cf32_le",
+    "core:sample_rate": 20000000.0,
+    "core:version": "1.0.0",
+    "core:hw": "HackRF One",
+    "core:recorder": "sigscan",
+    "core:num_channels": 1,
+    "core:description": "sigscan auto-collect; rep=1.0",
+    "sigscan:rep_version": "1.0",
+    "sigscan:target_src": "detected"
+  },
+  "captures": [
+    {
+      "core:sample_start": 0,
+      "core:frequency": 2439999988.9337006,
+      "core:datetime": "2026-06-02T07:47:33.484441Z"
+    }
+  ],
+  "annotations": [
+    {
+      "core:sample_start": 0,
+      "core:sample_count": 262144,
+      "core:freq_lower_edge": 2431080322.213522,
+      "core:freq_upper_edge": 2448697509.713522,
+      "core:label": "WiFi (2.4GHz, 20/40MHz)",
+      "core:comment": "ISM 2.4G (WiFi/BT): OFDM・矩形ブロック",
+      "sigscan:confidence": 0.78,
+      "sigscan:method": "rule",
+      "sigscan:snr_db": 36.6
+    }
+  ]
+}
