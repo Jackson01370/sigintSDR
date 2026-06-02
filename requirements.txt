@@ -5,3 +5,10 @@ matplotlib>=3.6      # スペクトログラムPNG保存に使用（任意・--s
 # --- 実機(HackRF)を使う場合は SoapySDR を dnf で導入（pip ではない）---
 # sudo dnf install python3-soapysdr SoapySDR SoapySDR-devel
 # SoapyHackRF のビルドは README 参照
+
+# --- eval-harness で外部学習済みモデルを“実体化”する場合のみ（任意）---
+# sigscan 本体・reference stand-in・eval.report は numpy のみで動く。
+# 外部モデル(torchsig / qoherent)の推論時だけ torch 系が必要。詳細は eval/README.md。
+# torch       # CPU版: pip install torch --index-url https://download.pytorch.org/whl/cpu
+# torchvision # qoherent DeepLabv3+MobileNetV3 用
+# torchsig    # TorchSig Sig53/WBSig53 用（Python>=3.10）
