@@ -62,7 +62,7 @@ def _default_sim_signals(rng: np.random.Generator) -> list[_SimSignal]:
 
 class SimBackend(SDRBackend):
     def __init__(self, cfg: SDRConfig, seed: int | None = 0,
-                 burst_per_capture: bool = False):
+                 burst_per_capture: bool = False, dc_offset: float = 0.0):
         self.cfg = cfg
         self.rng = np.random.default_rng(seed)
         self.signals = _default_sim_signals(self.rng)
@@ -71,6 +71,12 @@ class SimBackend(SDRBackend):
         # バースト挙動を擬似したいとき True にすると、capture_iq 毎に存在を再抽選し、
         # 同一帯でも観測ごとに出たり消えたりする（→ 持続率が 0〜1 で変化）。
         self.burst_per_capture = burst_per_capture
+        # ゼロIF受信機のDCオフセット擬似（診断用）。0 以外だと取得IQ全てに一定の
+        # 複素オフセットを足し、取得帯域の中央(オフセット0Hz)に時間不変の細い線
+        # （DCスパイク）を出す。サーベイ(sweep_power)には載せない＝実機同様に
+        # ドウェルIQの中央に現れる。既定 0（従来挙動）。品質ゲートの DCスパイク
+        # 除外を main.py 経由で確認するためのもの。
+        self.dc_offset = float(dc_offset)
 
     def _refresh_activity(self):
         for s in self.signals:
@@ -126,6 +132,9 @@ class SimBackend(SDRBackend):
                 bl = bl / (np.std(bl) + 1e-9) * a
                 comp = bl.astype(np.complex64)
             iq = iq + comp.astype(np.complex64)
+        if self.dc_offset:
+            # 中央(DC, オフセット0Hz)固定・時間不変の細い線 = DCスパイク擬似。
+            iq = iq + np.complex64(self.dc_offset)
         time.sleep(0.001)
         return iq
 

@@ -101,6 +101,15 @@ class QualityConfig:
     comb_spacing_tol_hz: float = 0.15e6   # 隣接間隔の一致許容
     comb_power_tol_db: float = 2.0        # ピーク強度の一致許容
     comb_min_run: int = 3                 # この本数以上並んだら全て破棄
+    # DCスパイク除外（DCオフセット由来の中央スパイク）。ゼロIF受信機(HackRF等)が
+    #   取得帯域のちょうど中央(中心周波数=オフセット0Hz)に出す、本物ではない細い線。
+    #   「中央集中(dc_excess)・時間不変(dc_excess の観測間ばらつき小)・細い」が揃った
+    #   ときのみ破棄する。中央からオフセットした信号・広帯域信号(WiFi等)・時間変動する
+    #   バースト(BLE等)は対象外（本物として残す）。
+    dc_band_hz: float = 60e3              # 中央バンドの半幅（|offset|<=これをDCとみなす）
+    dc_side_hz: float = 0.8e6            # 比較する両脇リングの外縁（dc_band〜これ）
+    dc_excess_min_db: float = 12.0       # 中央が両脇よりこれ以上高ければ「中央集中」
+    dc_excess_std_max: float = 3.0       # 観測間の excess ばらつきがこれ以下なら「時間不変」
 
 
 # ---------------------------------------------------------------------------

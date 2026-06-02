@@ -91,3 +91,44 @@ def test_measure_signal_tone():
     assert m["snr_db"] > 20.0
     # 中心はトーンのオフセット分だけずれる（center + 3MHz 付近）
     assert abs(m["center_hz"] - 2.453e9) < 1e6
+
+
+# ---------------------------------------------------------------------------
+# DCスパイク（DCオフセット由来の中央スパイク）測定
+#   ゼロIF受信機が取得帯域の中央(DC=オフセット0Hz)に出す、本物ではない細い線を
+#   1取得IQから測る。中央集中(dc_excess 大)は DC スパイクのみで立ち、中央外の
+#   信号・広帯域信号・無信号では立たないことを検証する。
+# ---------------------------------------------------------------------------
+def _dc_spike(level=0.5, seed=2):
+    """中央(DC, オフセット0Hz)固定の定数オフセット + 微小ノイズ = DCスパイク相当。"""
+    rng = np.random.default_rng(seed)
+    noise = 0.02 * (rng.normal(size=N) + 1j * rng.normal(size=N))
+    return (level + noise).astype(np.complex64)
+
+
+def test_dc_spike_metrics_flags_center_constant():
+    """中央(DC)固定の定数オフセットは dc_excess が大（中央だけ突出した細い線）。"""
+    m = dsp.dc_spike_metrics(_dc_spike(), RATE)
+    assert m["dc_excess_db"] > 30.0
+    assert m["dc_peak_db"] > m["side_med_db"]
+
+
+def test_dc_spike_metrics_ignores_offset_tone():
+    """中央からオフセットした細い信号は中央が上がらず dc_excess 小（脇のmedianも動かない）。"""
+    assert dsp.dc_spike_metrics(_tone(foff_hz=3e6), RATE)["dc_excess_db"] < 5.0
+    # 脇リング内(0.3MHz)に来ても、median は1ビンでは動かないので excess は小さい。
+    assert dsp.dc_spike_metrics(_tone(foff_hz=0.3e6), RATE)["dc_excess_db"] < 5.0
+
+
+def test_dc_spike_metrics_ignores_wideband():
+    """帯域を広く埋める信号(WiFi相当)は両脇も同様に上がり dc_excess 小。"""
+    assert dsp.dc_spike_metrics(
+        _band_limited_noise(half_bw_hz=8e6), RATE)["dc_excess_db"] < 5.0
+
+
+def test_dc_spike_metrics_ignores_noise():
+    """無信号(ノイズのみ)は中央も脇も同程度で dc_excess 小。"""
+    rng = np.random.default_rng(5)
+    noise = (0.02 * (rng.normal(size=N)
+                     + 1j * rng.normal(size=N))).astype(np.complex64)
+    assert dsp.dc_spike_metrics(noise, RATE)["dc_excess_db"] < 5.0

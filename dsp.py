@@ -147,6 +147,42 @@ def measure_signal(iq: np.ndarray, rate: float, center_hz: float) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# DCスパイク（DCオフセット由来の中央スパイク）測定
+# ---------------------------------------------------------------------------
+def dc_spike_metrics(iq: np.ndarray, rate: float,
+                     dc_band_hz: float = 60e3, side_hz: float = 0.8e6) -> dict:
+    """取得帯域の中央(DC, オフセット0Hz)に集中した細いスパイクの強さを測る。
+
+    ゼロIF受信機(HackRF等)は DC オフセットにより、中心周波数のちょうど中央に
+    本物の電波ではない細いスパイク(DCスパイク)を出す。これを 1 取得 IQ から測る。
+
+    中央バンド(|offset| <= dc_band_hz)のピーク電力と、その両脇のリング
+    (dc_band_hz < |offset| <= side_hz)の電力中央値を比べ、
+
+        dc_excess_db = dc_peak_db - side_med_db
+
+    を返す。中央だけ突出した細い線(DCスパイク)では大きく、帯域を広く埋める信号
+    (中央も脇も持ち上がる)・中央からオフセットした信号・無信号(脇と同程度)では
+    小さい。「中央集中かつ細い」を 1 指標で捉える(脇まで広がる=細くない なら脇が
+    上がって excess が縮む)。時間不変性は観測間で本指標のばらつきを見て別途判定する。
+
+    returns: dict(dc_excess_db, dc_peak_db, side_med_db)
+    """
+    freqs, p = welch_psd(iq, rate)
+    af = np.abs(freqs)
+    dc_mask = af <= dc_band_hz
+    side_mask = (af > dc_band_hz) & (af <= side_hz)
+    if not dc_mask.any() or not side_mask.any():
+        # バンド幅が分解能に対して狭すぎる等で測れない → 中立(0)を返す
+        return dict(dc_excess_db=0.0, dc_peak_db=float(p.max()),
+                    side_med_db=float(np.median(p)))
+    dc_peak = float(p[dc_mask].max())
+    side_med = float(np.median(p[side_mask]))
+    return dict(dc_excess_db=dc_peak - side_med,
+                dc_peak_db=dc_peak, side_med_db=side_med)
+
+
+# ---------------------------------------------------------------------------
 # スペクトログラム（CNN/LLM 連携の前段）
 # ---------------------------------------------------------------------------
 def spectrogram(iq: np.ndarray, rate: float, nfft: int = 512,

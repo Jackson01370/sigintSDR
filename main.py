@@ -35,7 +35,9 @@ def build_backend(args, cfg, dwell_mode: bool = False):
     from sdr import SimBackend
     # 滞在観測モードの sim では存在を取得毎に再抽選し、バースト挙動を擬似する
     # （合成なので限定的だが、持続率が 0〜1 で変化し品質ゲートの経路が通る）。
-    return SimBackend(cfg.sdr, seed=args.seed, burst_per_capture=dwell_mode)
+    dc = getattr(args, "sim_dc_spike", None)
+    return SimBackend(cfg.sdr, seed=args.seed, burst_per_capture=dwell_mode,
+                      dc_offset=(dc if dc is not None else 0.0))
 
 
 def main():
@@ -74,6 +76,10 @@ def main():
                    help="必要な最低持続率(0〜1)")
     p.add_argument("--q-narrow-bw", type=float, default=None, metavar="HZ",
                    help="極細スプリアスとみなす占有帯域幅の上限Hz")
+    p.add_argument("--q-dc-excess", type=float, default=None, metavar="DB",
+                   help="DCスパイク判定: 中央が両脇よりこのdB以上突出で中央集中")
+    p.add_argument("--q-dc-std", type=float, default=None, metavar="DB",
+                   help="DCスパイク判定: 中央集中のdBが観測間でこのdB以下なら時間不変")
     p.add_argument("--no-quality-gate", action="store_true",
                    help="品質ゲートを無効化（足切りせず全件保存）")
 
@@ -81,6 +87,10 @@ def main():
     p.add_argument("--vga", type=float, default=20.0)
     p.add_argument("--amp", action="store_true")
     p.add_argument("--seed", type=int, default=0, help="Sim用シード")
+    p.add_argument("--sim-dc-spike", nargs="?", type=float, const=0.5, default=None,
+                   metavar="LEVEL",
+                   help="Sim診断: 取得IQ中央にDCスパイク(DCオフセット由来の細い線)を注入"
+                        "(既定強度0.5)。品質ゲートのDCスパイク除外の確認用")
     p.add_argument("--quiet", action="store_true")
     args = p.parse_args()
 
@@ -109,6 +119,10 @@ def main():
         cfg.quality.min_persistence = args.q_min_persistence
     if args.q_narrow_bw is not None:
         cfg.quality.narrow_bw_hz = args.q_narrow_bw
+    if args.q_dc_excess is not None:
+        cfg.quality.dc_excess_min_db = args.q_dc_excess
+    if args.q_dc_std is not None:
+        cfg.quality.dc_excess_std_max = args.q_dc_std
     if args.no_quality_gate:
         cfg.quality.enabled = False
 

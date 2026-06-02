@@ -140,6 +140,89 @@ def test_comb_spur_reason_in_verdict():
     assert "comb-spur" in v.reasons
 
 
+# ---------------------------------------------------------------------------
+# DCスパイク除外（DCオフセット由来の中央スパイク）
+#   「中央集中(dc_excess 大) かつ 時間不変(dc_excess の観測間 std 小)」が揃った
+#   ときのみ dc_spike として破棄。中央外・広帯域・時間変動は本物として残す。
+# ---------------------------------------------------------------------------
+def test_dc_spike_center_constant_rejected():
+    """中央固定・時間不変・細いスパイク → dc_spike として破棄。"""
+    obs = _obs(bw_rep_hz=0.2e6, dc_excess_mean_db=53.0, dc_excess_std_db=0.5)
+    v = quality.evaluate_quality(obs, QualityConfig())
+    assert v.is_dc_spike
+    assert not v.passed
+    assert "dc-spike" in v.reasons
+
+
+def test_dc_spike_caught_where_narrow_steady_misses():
+    """narrow-steady-spur がすり抜ける条件でも dc_spike なら捕まえる。
+
+    実機では中央スパイクが他の信号に乗って snr_std が立ったり、サーベイ平滑で
+    bw が太って「細い」判定を外れたりして既存ゲートをすり抜ける。dc_excess は
+    高分解能PSDの中央集中を直接見るので、それらに依存せず破棄できる。
+    """
+    obs = _obs(snr_std_db=5.0,                     # 居座り判定(steady)を外す
+               dc_excess_mean_db=40.0, dc_excess_std_db=1.0)
+    v = quality.evaluate_quality(obs, QualityConfig(), bw_hz=2e6)  # 太いbwで narrow も外す
+    assert v.is_dc_spike
+    assert not v.passed
+    assert v.reasons == ["dc-spike"]               # 既存理由は立たず、dc-spike のみ
+
+
+def test_dc_spike_offset_signal_kept():
+    """(a) 中央からオフセットした細い信号 → dc_excess 小。破棄されない。"""
+    obs = _obs(bw_rep_hz=0.3e6, snr_std_db=15.0, persistence=0.6, n_detect=10,
+               dc_excess_mean_db=0.5, dc_excess_std_db=0.3)
+    v = quality.evaluate_quality(obs, QualityConfig())
+    assert not v.is_dc_spike
+    assert v.passed
+    assert v.reasons == []
+
+
+def test_dc_spike_time_varying_burst_kept():
+    """(b) 中央に出ても時間変動する細いバースト(BLE相当) → std 大。破棄されない。"""
+    obs = _obs(bw_rep_hz=0.3e6, snr_std_db=15.0, persistence=0.5, n_detect=10,
+               dc_excess_mean_db=26.0, dc_excess_std_db=26.0)  # 中央集中だが時間変動
+    v = quality.evaluate_quality(obs, QualityConfig())
+    assert not v.is_dc_spike                        # std が大きく時間不変ではない
+    assert v.passed
+    assert v.reasons == []
+
+
+def test_dc_spike_wideband_kept():
+    """(c) 広帯域信号(WiFi相当) → 両脇も上がり dc_excess 小。破棄されない。"""
+    obs = _obs(bw_rep_hz=20e6, dc_excess_mean_db=0.6, dc_excess_std_db=0.3)
+    v = quality.evaluate_quality(obs, QualityConfig())
+    assert not v.is_dc_spike
+    assert v.passed
+
+
+def test_dc_spike_thresholds_configurable():
+    """dc_spike しきい値が config で調整できる。"""
+    obs = _obs(snr_std_db=5.0, dc_excess_mean_db=20.0, dc_excess_std_db=1.0)
+    strict = quality.evaluate_quality(obs, QualityConfig(), bw_hz=2e6)
+    assert strict.is_dc_spike                       # 既定では中央集中とみなす
+    # excess 下限を上げれば中央集中とみなさない（= 残す）
+    loose = quality.evaluate_quality(
+        obs, QualityConfig(dc_excess_min_db=30.0), bw_hz=2e6)
+    assert not loose.is_dc_spike and loose.passed
+    # 時間不変の許容(std上限)を絞っても外れる
+    strict_std = quality.evaluate_quality(
+        obs, QualityConfig(dc_excess_std_max=0.5), bw_hz=2e6)
+    assert not strict_std.is_dc_spike and strict_std.passed
+
+
+def test_dc_spike_meta_recorded():
+    """品質メタ(sigscan:)に dc_spike 判定と指標が記録される。"""
+    obs = _obs(bw_rep_hz=0.2e6, dc_excess_mean_db=53.0, dc_excess_std_db=0.5)
+    v = quality.evaluate_quality(obs, QualityConfig())
+    meta = quality.quality_annotation_meta(obs, v)
+    assert meta["sigscan:dc_spike"] is True
+    assert meta["sigscan:dc_excess_db"] == 53.0
+    assert "sigscan:dc_excess_std_db" in meta
+    assert all(k.startswith("sigscan:") for k in meta)
+
+
 def test_quality_annotation_meta_keys():
     """annotation 用品質メタが sigscan: 名前空間で必要キーを持つ。"""
     obs = _obs()

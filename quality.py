@@ -29,6 +29,7 @@ class QualityVerdict:
     reasons: list = field(default_factory=list)   # 破棄理由（空なら合格）
     is_spur_suspect: bool = False                  # 単独での極細・居座りスプリアス疑い
     is_comb_spur: bool = False                      # 等間隔コムスプリアスの一員
+    is_dc_spike: bool = False                       # DCオフセット由来の中央スパイク
 
 
 def evaluate_quality(obs, qcfg, comb_spur: bool = False,
@@ -47,6 +48,14 @@ def evaluate_quality(obs, qcfg, comb_spur: bool = False,
     # 単独スプリアス疑い: 細い + ほぼ一定強度 + ほぼ常時 → 受信機内部スプリアス。
     spur_suspect = (narrow and steady
                     and obs.persistence >= qcfg.spur_persistence_min)
+    # DCスパイク疑い: 中央(DC)に集中して細い(dc_excess 大)かつ時間不変(観測間の
+    #   dc_excess ばらつき小)。中央集中・細さ・無信号でないことは dc_excess が
+    #   一体で捉える（脇まで広がる広帯域は脇が上がって excess が縮む、中央から
+    #   オフセットした信号は中央が上がらず excess が縮む）。時間変動するバースト
+    #   (BLE等)は excess の std が大きく外れる → 残す。survey 平滑後の bw に依存
+    #   しないので、検出帯に紛れた中央スパイクも取りこぼさない。
+    dc_spike = (obs.dc_excess_mean_db >= qcfg.dc_excess_min_db
+                and obs.dc_excess_std_db <= qcfg.dc_excess_std_max)
 
     reasons: list[str] = []
 
@@ -67,9 +76,14 @@ def evaluate_quality(obs, qcfg, comb_spur: bool = False,
     if comb_spur:
         reasons.append("comb-spur")
 
+    # 4) DCオフセット由来の中央スパイク（中央集中・時間不変・細い）
+    if dc_spike:
+        reasons.append("dc-spike")
+
     if not qcfg.enabled:
-        return QualityVerdict(True, [], spur_suspect, comb_spur)
-    return QualityVerdict(len(reasons) == 0, reasons, spur_suspect, comb_spur)
+        return QualityVerdict(True, [], spur_suspect, comb_spur, dc_spike)
+    return QualityVerdict(len(reasons) == 0, reasons, spur_suspect, comb_spur,
+                          dc_spike)
 
 
 def flag_comb_spurs(observations, qcfg, bw_list=None) -> list[bool]:
@@ -129,6 +143,9 @@ def quality_annotation_meta(obs, verdict) -> dict:
         "sigscan:snr_std_db": round(float(obs.snr_std_db), 2),
         "sigscan:bw_median_hz": round(float(obs.bw_median_hz), 1),
         "sigscan:spur_suspect": bool(verdict.is_spur_suspect or verdict.is_comb_spur),
+        "sigscan:dc_spike": bool(verdict.is_dc_spike),
+        "sigscan:dc_excess_db": round(float(obs.dc_excess_mean_db), 1),
+        "sigscan:dc_excess_std_db": round(float(obs.dc_excess_std_db), 2),
         "sigscan:quality_pass": bool(verdict.passed),
     }
 

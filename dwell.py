@@ -55,6 +55,12 @@ class DwellObservation:
     best_iq: np.ndarray         # 代表観測の生IQ（保存に使う）
     snr_series: list = field(default_factory=list)   # 各観測の検出マージン(dB)
     bw_series: list = field(default_factory=list)     # 各観測の帯域幅(Hz)
+    # DCスパイク（中央スパイク）指標。dc_excess = 中央集中の強さ(dB)。
+    #   平均が大きい=中央集中して細い、観測間の std が小さい=時間不変。両方揃えば
+    #   DCオフセット由来の中央スパイクを疑う（quality.py で判定）。
+    dc_excess_mean_db: float = 0.0       # 中央集中の強さ(dB)の平均
+    dc_excess_std_db: float = 0.0        # 中央集中の強さ(dB)の観測間ばらつき
+    dc_excess_series: list = field(default_factory=list)  # 各観測の dc_excess(dB)
 
 
 def observe_dwell(backend, center_hz: float, rate: float, n_samples: int,
@@ -74,13 +80,19 @@ def observe_dwell(backend, center_hz: float, rate: float, n_samples: int,
     deadline = time_fn() + max(0.0, float(dcfg.dwell_seconds))
     obs_list: list[dict] = []
     iqs: list[np.ndarray] = []
+    dc_excess: list[float] = []
     k = 0
 
     # --- 収集フェーズ: 反復観測して測定値を貯める ---
     while True:
         iq = backend.capture_iq(center_hz, rate, n_samples)
         m = dsp.measure_signal(iq, rate, center_hz)
+        # DCスパイク指標: 中央(DC)が両脇よりどれだけ突出して細いか(dB)。
+        #   観測ごとに測り、後段で平均(中央集中)と std(時間不変性)を取る。
+        dcm = dsp.dc_spike_metrics(iq, rate, dc_band_hz=qcfg.dc_band_hz,
+                                   side_hz=qcfg.dc_side_hz)
         obs_list.append(m)
+        dc_excess.append(float(dcm["dc_excess_db"]))
         iqs.append(np.asarray(iq, dtype=np.complex64))
         k += 1
         if k >= dcfg.max_observations:
@@ -105,6 +117,8 @@ def observe_dwell(backend, center_hz: float, rate: float, n_samples: int,
     best = obs_list[best_i]
     det_vals = det_snr[detected]
 
+    dc_arr = np.asarray(dc_excess, dtype=float)
+
     return DwellObservation(
         center_hz=float(center_hz),
         target_src=target_src,
@@ -124,4 +138,7 @@ def observe_dwell(backend, center_hz: float, rate: float, n_samples: int,
         best_iq=iqs[best_i],
         snr_series=[round(float(x), 2) for x in det_snr],
         bw_series=[float(x) for x in bw_arr],
+        dc_excess_mean_db=float(dc_arr.mean()),
+        dc_excess_std_db=float(dc_arr.std()),
+        dc_excess_series=[round(float(x), 2) for x in dc_arr],
     )
