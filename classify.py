@@ -27,9 +27,16 @@ SIGNAL_DB: list[tuple] = [
     ("GPS L5",      None,            "GPS/QZSS L5",           0.75, "拡散・~24MHz"),
     ("GPS L2",      None,            "GPS L2",                0.70, ""),
     ("GLONASS",     None,            "GLONASS L1",            0.65, "FDMA"),
+    # [混入注意 BANDPLAN_PROPOSAL §X1] 2412/2437/2462/2484MHz は空間伝送型WPT(無線電力
+    #   伝送)がWiFiチャネル中心と重なり、強い定常信号として WiFi/レーダと誤認されうる。
+    # [混入注意 §X4] 2400-2450MHz は Amateur(2.4G) が ISM と重複し用途確定が難しい
+    #   (低確信度→Unknown で吸収)。WPT判定や用途弾きの実ロジックは将来課題（今回は注記のみ）。
     ("ISM 2.4G",    (15e6, 45e6),    "WiFi (2.4GHz, 20/40MHz)", 0.78, "OFDM・矩形ブロック"),
     ("ISM 2.4G",    (None, 3e6),     "BLE/Bluetooth (adv?)",  0.62, "狭帯域・ホッピング"),
     ("ISM 2.4G",    (3e6, 15e6),     "Zigbee/独自2.4G",        0.55, ""),
+    # [混入注意 §X2/§X3] 5250-5372.5(W53) / 5470-5725(W56) は気象レーダ(Pulse)が
+    #   WiFi(OFDM)と同居しDFS対象。同一帯域に方式の異なる信号が混在するため、用途では
+    #   なく方式ラベルでの分離が要。レーダ/WiFi 弁別の実ロジックは将来課題（注記のみ）。
     ("WiFi 5G",     (15e6, 180e6),   "WiFi (5GHz, 20-160MHz)", 0.78, "OFDM"),
     ("ISM 5.8G",    (10e6, 30e6),    "FPVドローン映像 or 5.8G WiFi", 0.55, "アナログ/デジタル映像の可能性"),
     ("ISM 5.8G",    (None, 10e6),    "ETC/DSRC or コードレス",  0.55, "5.8GHz帯狭帯域"),

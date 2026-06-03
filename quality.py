@@ -46,6 +46,9 @@ def evaluate_quality(obs, qcfg, comb_spur: bool = False,
     narrow = bw < qcfg.narrow_bw_hz
     steady = obs.snr_std_db <= qcfg.spur_snr_std_max
     # 単独スプリアス疑い: 細い + ほぼ一定強度 + ほぼ常時 → 受信機内部スプリアス。
+    # [混入注意 BANDPLAN_PROPOSAL §X1] 2412/2437/2462/2484MHz 付近の「強い定常信号」は
+    #   空間伝送型WPT(無線電力伝送)という実在の外来信号のことがあり、受信機内部スプリアス
+    #   とは別物。周波数を見たWPT弁別ロジックは将来課題で、今は通常どおり判定する（注記のみ）。
     spur_suspect = (narrow and steady
                     and obs.persistence >= qcfg.spur_persistence_min)
     # DCスパイク疑い: 中央(DC)に集中して細い(dc_excess 大)かつ時間不変(観測間の
