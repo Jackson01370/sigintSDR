@@ -61,6 +61,65 @@ def test_remove_dc_kills_center_spike_metric():
     assert before - after > 15.0    # 大幅に低下
 
 
+def _timevarying_dc(n, rate, seed=0, amp=0.05, scale=0.02):
+    """時間変動するDCオフセット（ゼロIF受信機のLO漏れドリフト擬似）を乗せたノイズIQ。
+
+    実機のDCドリフトは超低域に集中する揺らぎ（ランダムウォーク的）。一定成分(exact 0Hz)
+    は別途除去済み相当にし、低周波に広がる残留だけを残す。これは静的な complex mean
+    では取りきれず（0Hz成分しか消えない）中央に残留スパイクとして出るので、rate 指定の
+    追従ハイパスが要る状況を再現する。実ドウェルと同じ長さ(262144)で評価する。
+    """
+    rng = np.random.default_rng(seed)
+    noise = amp * (rng.normal(size=n) + 1j * rng.normal(size=n))
+    walk = np.cumsum(rng.normal(size=n) + 1j * rng.normal(size=n))   # 低域集中
+    walk = (walk - walk.mean())                                       # exact 0Hz は除去済み相当
+    walk = walk / np.std(walk) * scale
+    return (noise + walk).astype(np.complex64)
+
+
+def _dc_excess_db(iq, rate):
+    f, p = dsp.welch_psd(iq, rate, nperseg=512)
+    c = int(np.argmin(np.abs(f)))
+    bh = rate / 512
+    side = (np.abs(f) > 5 * bh) & (np.abs(f) < 2e6)
+    return float(p[c] - np.median(p[side]))
+
+
+def test_remove_dc_rate_tracks_time_varying_dc():
+    """rate 指定の追従ハイパスは、静的平均で残る時間変動DC残留も平坦化する。
+
+    へこみ(負の過補正)もスパイク(正の残留)も残さない（中央が両脇とほぼ同程度）。
+    """
+    n_big = 1 << 18                              # 実ドウェルサイズ（窓が記録長に対し十分小）
+    sig = _timevarying_dc(n_big, RATE)
+    static = dsp.remove_dc(sig)                  # rate=None: 静的平均のみ
+    tracked = dsp.remove_dc(sig, rate=RATE)      # rate 指定: 追従ハイパス
+    e_static = _dc_excess_db(static, RATE)
+    e_tracked = _dc_excess_db(tracked, RATE)
+    assert e_static > 6.0                         # 静的平均では中央に残留スパイク
+    assert abs(e_tracked) < 3.0                   # 追従後は両脇と同程度（平坦・へこみ無し）
+    assert e_static - e_tracked > 6.0             # 残留が大幅に低下
+
+
+def test_remove_dc_rate_preserves_offcenter_signal():
+    """追従ハイパス(コーナー~10kHz)は中央外の信号ピークを壊さない。"""
+    t = np.arange(N) / RATE
+    sig = (np.exp(2j * np.pi * 3e6 * t) + _noise(N)).astype(np.complex64)
+    _, p_before = dsp.welch_psd(sig, RATE)
+    _, p_after = dsp.welch_psd(dsp.remove_dc(sig, rate=RATE), RATE)
+    assert abs(p_before.max() - p_after.max()) < 0.5         # ピーク不変
+    assert int(np.argmax(p_before)) == int(np.argmax(p_after))   # 位置不変
+
+
+def test_remove_dc_short_capture_falls_back_to_static():
+    """窓長が取得長以上の短い取得では静的平均にフォールバック（例外を出さない）。"""
+    short = (np.full(8, 0.5, dtype=np.complex64)
+             + _noise(8)).astype(np.complex64)
+    out = dsp.remove_dc(short, rate=RATE)        # win=rate/10k≫8 → 静的平均
+    assert out.dtype == np.complex64 and out.size == 8
+    assert abs(out.mean()) < 1e-5                # 平均が引かれている
+
+
 def test_remove_dc_center_bin_drops_to_sides():
     """除去後の中央(0Hz)ビンのパワーが、除去前より大幅に下がり両脇と同程度になる。"""
     spiked = (_noise(N) + np.complex64(0.7)).astype(np.complex64)

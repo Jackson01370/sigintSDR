@@ -149,24 +149,46 @@ def measure_signal(iq: np.ndarray, rate: float, center_hz: float) -> dict:
 # ---------------------------------------------------------------------------
 # DCオフセット除去（DCスパイク除去 / DC offset correction）
 # ---------------------------------------------------------------------------
-def remove_dc(iq: np.ndarray) -> np.ndarray:
-    """複素IQ全体の平均（複素DCオフセット）を引いて中央スパイクを消す。
+def remove_dc(iq: np.ndarray, rate: float | None = None,
+              corner_hz: float = 10e3) -> np.ndarray:
+    """DCオフセット/低周波ドリフトを除去し、取得帯域中央のDCスパイクを平坦化する。
 
-    ゼロIF受信機(HackRF等)は信号全体に定常的なDCオフセットを乗せ、取得帯域の
-    ちょうど中央(オフセット0Hz)に本物ではない時間不変の細い線(DCスパイク)を出す。
-    その主因は複素平均に現れる定常オフセットなので、各サンプルから平均を引けば
-    中央スパイクが消える（他のSDRソフトと同じ定番の DC offset correction）。
-    平均は中央外にオフセットした信号・帯域内ノイズに対しては ~0 なので、本物の
-    信号やその占有帯域は壊さない（除去するのは0Hz成分のみ）。
+    ゼロIF受信機(HackRF等)は信号全体にDCオフセットを乗せ、取得帯域のちょうど中央
+    (オフセット0Hz)に本物ではない細い線(DCスパイク)を出す。これを「捨てる」のでは
+    なく信号から除く DC offset correction。
 
-    平均は complex128 で蓄積してから引く（complex64 のまま大きな配列を足すと
-    丸め誤差で中央を引き切れないことがある）。空配列はそのまま返す。
+    - rate=None: 複素平均(定常DC)のみを各サンプルから引く軽量版。中央外にオフセット
+      した信号・帯域内ノイズに対して平均は ~0 なので本物は壊さないが、実機のDCは
+      取得中に**時間変動(LO漏れドリフト)**するため、静的平均では中央に残留スパイク
+      (+数dB)が残ることがある。
+    - rate 指定: 移動平均(窓長 win = rate / corner_hz)を引くハイパスで、時間変動する
+      DC にも追従して除去する。コーナー周波数 corner_hz は spec の周波数ビン幅より
+      十分細かく取るので、中央にスパイク(突出)もノッチ(へこみ)も残さず平坦になる。
+      実機の受信入口(HackRFBackend)はこちらを使う。
+
+    複素平均は complex128 で蓄積してから引く（complex64 のまま大きな配列を足すと
+    丸め誤差で引き切れないことがある）。空配列はそのまま返す。
     """
     iq = np.asarray(iq, dtype=np.complex64)
     if iq.size == 0:
         return iq
-    mean = iq.mean(dtype=np.complex128)
-    return (iq - mean).astype(np.complex64)
+    if rate is None:
+        mean = iq.mean(dtype=np.complex128)
+        return (iq - mean).astype(np.complex64)
+    # 時間変動DCに追従: 窓長 win の移動平均(局所DC)を引くハイパス。
+    win = max(2, int(round(float(rate) / max(1.0, float(corner_hz)))))
+    if win >= iq.size:           # 窓が取得長以上の短い取得 → 静的平均にフォールバック
+        mean = iq.mean(dtype=np.complex128)
+        return (iq - mean).astype(np.complex64)
+    x = iq.astype(np.complex128)
+    n = x.size
+    half = win // 2
+    csum = np.concatenate(([0.0 + 0.0j], np.cumsum(x)))   # 累積和で O(n) 移動平均
+    i = np.arange(n)
+    lo = np.clip(i - half, 0, n)
+    hi = np.clip(i - half + win, 0, n)
+    ma = (csum[hi] - csum[lo]) / (hi - lo)                # 各点の局所平均(端は窓を縮める)
+    return (x - ma).astype(np.complex64)
 
 
 # ---------------------------------------------------------------------------

@@ -1,0 +1,47 @@
+{
+  "global": {
+    "core:datatype": "cf32_le",
+    "core:sample_rate": 20000000.0,
+    "core:version": "1.0.0",
+    "core:hw": "HackRF One",
+    "core:recorder": "sigscan",
+    "core:num_channels": 1,
+    "core:description": "sigscan dwell-collect; rep=1.0",
+    "sigscan:rep_version": "1.0",
+    "sigscan:target_src": "detected",
+    "sigscan:capture_mode": "dwell",
+    "sigscan:dc_removed": false
+  },
+  "captures": [
+    {
+      "core:sample_start": 0,
+      "core:frequency": 2438177327.1329412,
+      "core:datetime": "2026-06-02T23:33:06.175891Z"
+    }
+  ],
+  "annotations": [
+    {
+      "core:sample_start": 0,
+      "core:sample_count": 262144,
+      "core:freq_lower_edge": 2431418210.575728,
+      "core:freq_upper_edge": 2447340085.575728,
+      "core:label": "WiFi (2.4GHz, 20/40MHz)",
+      "core:comment": "ISM 2.4G (WiFi/BT): OFDM・矩形ブロック",
+      "sigscan:confidence": 0.78,
+      "sigscan:method": "rule",
+      "sigscan:snr_db": 42.0,
+      "sigscan:dwell_obs": 17,
+      "sigscan:dwell_detect": 17,
+      "sigscan:persistence": 1.0,
+      "sigscan:snr_max_db": 42.0,
+      "sigscan:snr_mean_db": 38.9,
+      "sigscan:snr_std_db": 6.73,
+      "sigscan:bw_median_hz": 1855468.8,
+      "sigscan:spur_suspect": false,
+      "sigscan:dc_spike": false,
+      "sigscan:dc_excess_db": 37.4,
+      "sigscan:dc_excess_std_db": 9.87,
+      "sigscan:quality_pass": true
+    }
+  ]
+}

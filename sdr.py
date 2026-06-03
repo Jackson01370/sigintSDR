@@ -142,7 +142,7 @@ class SimBackend(SDRBackend):
             iq = iq + np.complex64(self.dc_offset)
         if self.dc_removal:
             # 実機の HackRFBackend と同じく受信入口で DC オフセットを除去する。
-            iq = remove_dc(iq)
+            iq = remove_dc(iq, rate=rate)
         time.sleep(0.001)
         return iq
 
@@ -209,8 +209,10 @@ class HackRFBackend(SDRBackend):
         out = buff[:got] if got else buff
         if self.dc_removal:
             # 受信の最も入口で DC オフセットを除去（取得帯域中央のDCスパイクを消す）。
-            # 以降の全処理（サーベイ/ドウェル/測定/画像化/保存）が DC 除去済みを見る。
-            out = remove_dc(out)
+            # rate を渡し、時間変動するDC(LO漏れドリフト)に追従するハイパスで平坦化する
+            # （静的平均だけだと中央に残留スパイク/へこみが残るため）。以降の全処理
+            # （サーベイ/ドウェル/測定/画像化/保存）が DC 除去済みを見る。
+            out = remove_dc(out, rate=rate)
         return out
 
     def sweep_power(self, start_hz, stop_hz, bin_hz):

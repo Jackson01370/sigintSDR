@@ -20,6 +20,7 @@ import sys
 
 import numpy as np
 
+import dsp
 import sigmf_io
 import spec
 
@@ -57,8 +58,13 @@ def _meta_summary(meta: dict) -> dict:
     }
 
 
-def render_one(base: str, out_path: str) -> dict:
-    """1レコード(base.sigmf-*)を読み、PNG を1枚書き出す。要約 dict を返す。"""
+def render_one(base: str, out_path: str, flatten_dc: bool = False) -> dict:
+    """1レコード(base.sigmf-*)を読み、PNG を1枚書き出す。要約 dict を返す。
+
+    flatten_dc=True なら、画像化の前に時間変動DC追従のハイパス(dsp.remove_dc に rate を
+    渡す)で中央のDCスパイク残留を平坦化する。表示時のみの処理で、保存済み生IQ
+    (.sigmf-data)には一切触れない（凍結 spec.render もそのまま）。
+    """
     import matplotlib
     matplotlib.use("Agg")  # 画面なしで画像ファイルだけ作る
     import matplotlib.pyplot as plt
@@ -66,6 +72,10 @@ def render_one(base: str, out_path: str) -> dict:
     iq, meta = sigmf_io.read_recording(base)
     info = _meta_summary(meta)
     rate = info["rate"]
+
+    if flatten_dc:
+        # 既存キャプチャの中央DCスパイク残留を表示時に平坦化（生IQは不変）。
+        iq = dsp.remove_dc(iq, rate=rate)
 
     # 凍結契約と同じ正準スペクトログラム（縦256=周波数, 横256=時間, 0..1）
     img = spec.render(iq, rate)
@@ -123,6 +133,9 @@ def main(argv=None) -> int:
     p.add_argument("dir", help="SigMF を格納したディレクトリ（例: captures/）")
     p.add_argument("--out", default=None, help="画像の出力先（既定: <dir>/_images）")
     p.add_argument("--limit", type=int, default=None, help="先頭から処理する件数")
+    p.add_argument("--flatten-dc", action="store_true",
+                   help="表示時に中央のDCスパイク残留を平坦化（時間変動DC追従ハイパス）。"
+                        "保存済み生IQには触れない")
     args = p.parse_args(argv)
 
     metas = sorted(glob.glob(os.path.join(args.dir, "*.sigmf-meta")))
@@ -142,7 +155,7 @@ def main(argv=None) -> int:
         name = os.path.basename(base)
         out_path = os.path.join(out_dir, name + ".png")
         try:
-            info = render_one(base, out_path)
+            info = render_one(base, out_path, flatten_dc=args.flatten_dc)
             tag = info["label"] or "(no label)"
             print(f"  OK  {name}.png   {info['center']/1e6:.1f}MHz  {tag}")
             ok += 1
