@@ -183,3 +183,82 @@ def test_dwell_mode_strict_discards_transient(tmp_path):
     assert sched._collected == 0                          # 単発は保存しない
     assert not glob.glob(os.path.join(collect, "*.sigmf-data"))
     assert len(store.recent(50)) >= 1                     # ただし検出ログは残す
+
+
+# ===========================================================================
+# 帯域フォーカス（band_focus / --focus）
+#   指定 [start, stop] に張り付き、_build_targets の合流点(add)1点で範囲外候補を
+#   除外する。既定 OFF（従来挙動）。SimBackend + 完全 BAND_PLAN で検証する。
+# ===========================================================================
+_FOCUS_LO, _FOCUS_HI = 2.4e9, 2.5e9
+
+
+def _focus_sched(band_focus, max_dwell=6):
+    """完全 BAND_PLAN・範囲 2.4-2.5GHz の scheduler を作る（store なし）。
+
+    bands は Config 既定の完全バンドプラン（GPS/W56 等の範囲外バンドを含む）を
+    使い、関所の効きを実バンドプランで検証する。band_focus 以外は既定。
+    """
+    sdr = SDRConfig(dwell_samples=1 << 14)
+    scan = ScanConfig(start_hz=_FOCUS_LO, stop_hz=_FOCUS_HI,
+                      band_focus=band_focus, max_dwell_per_cycle=max_dwell)
+    cfg = Config(sdr=sdr, scan=scan)
+    be = SimBackend(cfg.sdr, seed=0)
+    return HybridScheduler(be, cfg)
+
+
+def test_focus_on_excludes_out_of_band_plan_targets():
+    """T1: focus ON で範囲外バンドプラン目標(GPS/W56 等)が targets に出ない。"""
+    sched = _focus_sched(band_focus=True)
+    sched._segments = []                       # サーベイ検出なし＝巡回のみで埋める
+    targets = sched._build_targets()
+    assert targets                             # 範囲内バンドで埋まる（空にならない）
+    for t in targets:
+        assert _FOCUS_LO <= t["center"] <= _FOCUS_HI, t
+    # 範囲外バンド由来（GPS 1176MHz / W56 5597MHz 等）は1件も無い
+    assert not any(t["center"] < _FOCUS_LO or t["center"] > _FOCUS_HI
+                   for t in targets)
+
+
+def test_focus_on_excludes_survey_spillover():
+    """T2: 範囲端の外(2504MHz 相当)のサーベイ由来候補も同じ関所で消える。"""
+    sched = _focus_sched(band_focus=True)
+    # サーベイ端の食み出しを模した検出帯を注入（--stop 2.5e9 の外側）。
+    sched._segments = [dict(f_lo=2.503e9, f_hi=2.505e9, f_center=2.504e9,
+                            bw_hz=1e6, peak_db=-40.0, snr_db=20.0)]
+    targets = sched._build_targets()
+    assert all(_FOCUS_LO <= t["center"] <= _FOCUS_HI for t in targets)
+    assert not any(abs(t["center"] - 2.504e9) < 1e6 for t in targets)
+
+
+def test_focus_off_keeps_out_of_band_targets_regression():
+    """T3: focus OFF は従来どおり範囲外バンドプラン目標を含む（回帰ロック）。"""
+    sched = _focus_sched(band_focus=False)
+    sched._segments = []
+    targets = sched._build_targets()
+    # バンドプラン巡回は範囲外(例: GPS<2.4GHz)も従来どおり拾う
+    assert any(t["center"] < _FOCUS_LO or t["center"] > _FOCUS_HI
+               for t in targets), targets
+    assert any(t["src"].startswith("band:") for t in targets)
+
+
+def test_focus_records_band_focus_in_sigmf_global(tmp_path):
+    """T4: focus 有効で収集した記録の global に sigscan:band_focus が載る。"""
+    collect = str(tmp_path / "captures")
+    sdr = SDRConfig(dwell_samples=1 << 14)
+    scan = ScanConfig(start_hz=_FOCUS_LO, stop_hz=_FOCUS_HI,
+                      band_focus=True, max_dwell_per_cycle=2)
+    cfg = Config(sdr=sdr, scan=scan)
+    store = Store(str(tmp_path / "t.db"))
+    be = SimBackend(cfg.sdr, seed=0)
+    sched = HybridScheduler(be, cfg, store=store, collect_dir=collect,
+                            collect_snr_min=0.0)
+    sched.run(once=True, verbose=False)
+
+    data_files = sorted(glob.glob(os.path.join(collect, "*.sigmf-data")))
+    assert len(data_files) >= 1
+    base = data_files[0][: -len(".sigmf-data")]
+    _, meta = sigmf_io.read_recording(base)
+    # 来歴は範囲つき dict で記録（bool ではなく {"start","stop"}）
+    assert meta["global"]["sigscan:band_focus"] == {"start": _FOCUS_LO,
+                                                     "stop": _FOCUS_HI}

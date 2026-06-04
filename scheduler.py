@@ -45,6 +45,10 @@ class HybridScheduler:
         # 受信入口で DC オフセット補正(DCスパイク除去)を適用したか。保存する SigMF の
         # global に sigscan:dc_removed として正直に記録する（後で再レンダ/学習時に判別可）。
         self._dc_removed = bool(getattr(backend, "dc_removal", False))
+        # 帯域フォーカス: 指定 [start, stop] に張り付き、範囲外候補を _build_targets の
+        # 出口で除外する（関所は1点のみ）。収集記録には来歴として SigMF global に
+        # sigscan:band_focus を残す（dc_removed と同じ流儀）。既定 OFF で挙動不変。
+        self._band_focus = bool(cfg.scan.band_focus)
         self._last_survey = 0.0
         self._segments: list[dict] = []
         # ホットバンドを優先度の重み付きで巡回するためのイテレータ
@@ -56,6 +60,19 @@ class HybridScheduler:
             os.makedirs(cfg.scan.spectrogram_dir, exist_ok=True)
         if self.collect_dir:
             os.makedirs(self.collect_dir, exist_ok=True)
+
+    # --- フォーカス来歴 ---
+    def _focus_global(self) -> dict:
+        """フォーカス収集の SigMF global 来歴。
+
+        focus OFF 時は空 dict を返す（global に何も足さない＝記録も挙動も不変）。
+        dc_removed と同じく write 側のシグネチャは不変のまま、呼び出し側が
+        extra_global に key を足す形（** 展開）で記録する。範囲も素直に残す。
+        """
+        if not self._band_focus:
+            return {}
+        return {"sigscan:band_focus": {"start": self.cfg.scan.start_hz,
+                                       "stop": self.cfg.scan.stop_hz}}
 
     # --- サーベイ ---
     def survey(self) -> list[dict]:
@@ -74,6 +91,15 @@ class HybridScheduler:
         seen: list[float] = []
 
         def add(center, bw, src, snr=0.0):
+            # 関所: 帯域フォーカス（範囲外除外はこの1点＝候補の合流点に集約）。
+            # focus 有効時、中心周波数が [start, stop] 外の候補をここで弾く。これで
+            #   a. バンドプラン巡回由来の範囲外目標（例: 2.4GHz指定時の GPS/W56）
+            #   b. サーベイ端の食み出し検出（例: --stop 2.5e9 での 2504/2512MHz）
+            # の両方が同じ関所で消える。弾いた候補は seen も汚さない。focus OFF 時は
+            # 素通り（従来どおり・挙動不変）。バンド巡回(step2)はこの関所で範囲外を
+            # 飛ばしつつ枠が埋まるまで範囲内バンドを拾い続けるため、指定帯域に張り付く。
+            if self._band_focus and not (sc.start_hz <= center <= sc.stop_hz):
+                return
             for c in seen:
                 if abs(c - center) < max(bw, 1e6):   # 近接重複は除外
                     return
@@ -152,7 +178,8 @@ class HybridScheduler:
                     description=f"sigscan auto-collect; rep={spec.SIGSCAN_REP_VERSION}",
                     extra_global={"sigscan:rep_version": spec.SIGSCAN_REP_VERSION,
                                   "sigscan:target_src": target.get("src", ""),
-                                  "sigscan:dc_removed": self._dc_removed},
+                                  "sigscan:dc_removed": self._dc_removed,
+                                  **self._focus_global()},
                 )
                 self._collected += 1
                 self._recent_collect.append(
@@ -174,7 +201,8 @@ class HybridScheduler:
             extra_global={"sigscan:rep_version": spec.SIGSCAN_REP_VERSION,
                           "sigscan:target_src": target.get("src", ""),
                           "sigscan:capture_mode": "dwell",
-                          "sigscan:dc_removed": self._dc_removed},
+                          "sigscan:dc_removed": self._dc_removed,
+                          **self._focus_global()},
         )
         # 凍結 write_recording は annotation の任意キーを通さないため、書き出し後に
         # 品質メタ（sigscan:）を annotation へ最小限 patch する（生IQには触れない）。

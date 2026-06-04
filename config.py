@@ -43,6 +43,14 @@ class ScanConfig:
     start_hz: float = 1.0e9
     stop_hz: float = 6.0e9
 
+    # 帯域フォーカス: True かつ start/stop 指定時、ターゲット候補の合流点
+    #   （_build_targets の出口）で中心周波数が [start, stop] 外の候補を1点だけ
+    #   除外し、指定帯域に張り付く。これでバンドプラン巡回由来の範囲外目標と
+    #   サーベイ端の食み出し検出の両方が同じ関所で消える。既定 False（従来どおり
+    #   バンドプラン全巡回・挙動不変）。CLI --focus で有効化。範囲は既存の
+    #   start/stop を流用し、新たな範囲指定は作らない。
+    band_focus: bool = False
+
     # サーベイの周波数分解能（FFTビン幅相当）。粗くて速い設定。
     survey_bin_hz: float = 200e3
     # サーベイ1ステップでカバーする帯域（瞬時帯域以下に）。

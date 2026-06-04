@@ -56,6 +56,9 @@ def main():
 
     p.add_argument("--start", type=float, default=None, help="開始周波数(Hz)")
     p.add_argument("--stop", type=float, default=None, help="終了周波数(Hz)")
+    p.add_argument("--focus", action="store_true",
+                   help="指定した --start/--stop の範囲だけに張り付き、バンドプラン"
+                        "巡回による範囲外への寄り道をやめる(範囲未指定なら無視)")
     p.add_argument("--once", action="store_true", help="1サイクルで終了")
     p.add_argument("--survey-interval", type=float, default=None, help="サーベイ間隔(秒)")
     p.add_argument("--save-spectrograms", action="store_true", help="PNG保存(CNN/LLM前段)")
@@ -118,6 +121,16 @@ def main():
     if args.save_spectrograms:
         cfg.scan.save_spectrograms = True
 
+    # 帯域フォーカス: 指定 [start, stop] に張り付き、バンドプラン巡回の範囲外
+    # 寄り道をやめる。start/stop が両方とも未指定（既定の全域 1-6GHz）では効果が
+    # 無く来歴も誤解を招くため、警告して無視する（推奨どおり「警告つき無視」）。
+    if args.focus:
+        if args.start is None and args.stop is None:
+            print("警告: --focus は --start/--stop と併用してください"
+                  "（範囲が未指定のため無視します）")
+        else:
+            cfg.scan.band_focus = True
+
     # 滞在観測モード: --dwell か --dwell-seconds の指定で有効化。
     dwell_mode = bool(args.dwell or args.dwell_seconds is not None)
     if args.dwell_seconds is not None:
@@ -143,6 +156,9 @@ def main():
     mode = "HackRF実機" if args.hardware else "シミュレーション"
     print(f"sigscan  mode={mode}  "
           f"range={cfg.scan.start_hz/1e9:.2f}-{cfg.scan.stop_hz/1e9:.2f}GHz")
+    if cfg.scan.band_focus:
+        print(f"帯域フォーカス: {cfg.scan.start_hz/1e9:.2f}-"
+              f"{cfg.scan.stop_hz/1e9:.2f}GHz に集中（バンドプラン巡回オフ）")
 
     backend = build_backend(args, cfg, dwell_mode=dwell_mode)
     dc_state = "有効" if getattr(backend, "dc_removal", False) else "無効"
