@@ -5,3 +5,5 @@ mnt/
 captures/
 .venv/
 .pytest_cache/
+simdata/
+runs/
