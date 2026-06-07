@@ -24,13 +24,13 @@ REP_VERSION = spec.SIGSCAN_REP_VERSION
 # look: [256,256] 正準表現（縦=周波数, 横=時間）での「見え方」の根拠。
 CLASS_INFO: list[dict] = [
     dict(name="wideband-ofdm",
-         look="広帯域(12〜16MHz)・全時間で持続する明るい大ブロック"),
+         look="広帯域(12〜16MHz)・不規則間隔/可変幅の広帯域バースト列(実WiFiパケット様)"),
     dict(name="narrowband-burst",
          look="狭帯域(1〜2.5MHz)・時間の一部だけ点く短いブロック(BLE/バースト風)"),
     dict(name="cw-tone",
-         look="単一周波数・全時間に伸びる細い横線(連続波トーン)"),
+         look="中心外(|off|>0.5MHz)の細い横線=連続波トーン(中心0Hzの細線はDC残留)"),
     dict(name="pulse-radar",
-         look="広帯域・周期的に点滅する縦縞(パルス列/レーダ風)"),
+         look="広帯域・厳密に周期的な短い縦縞(パルス列/レーダ風)"),
     dict(name="noise-only",
          look="信号なし・構造のない一様な低レベル背景(ノイズのみ)"),
 ]

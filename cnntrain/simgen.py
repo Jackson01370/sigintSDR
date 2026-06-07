@@ -1,8 +1,17 @@
 """cnntrain (1/6): Sim データ生成 CLI（torch 非依存）。
 
 5 つの **方式軸（見え方）クラス** の合成 IQ を numpy で直接合成し、凍結
-`sigmf_io.write_recording` で SigMF として保存する。生成手段に SimBackend を
-使わず numpy 直接合成を選んだ理由:
+`sigmf_io.write_recording` で SigMF として保存する。
+
+M2 実測アライン（M1.5プローブ+人間の画像確認で確定した乖離を反映）:
+  * DC 残留線を全クラス一律（クラス無相関）に注入（_inject_dc_residual）。実BLEの
+    cw-tone 誤認の真犯人＝中心の DC 残留線を再現。注入は IQ(時間領域)で行い凍結
+    spec.render を通す（画像描き込みは禁止）。強度は実測 dc_excess に較正。
+  * wideband-ofdm を「全時間持続の塊」から「非周期・可変幅の広帯域バースト列」へ
+    再定義（実WiFiパケット様）。pulse-radar（厳密周期・短パルス）との対比は維持。
+  * cw-tone は中心から |off|>0.5MHz に制約（注入DC線と分離）。
+
+生成手段に SimBackend を使わず numpy 直接合成を選んだ理由:
   * SimBackend の環境は固定の周波数割当で、クラス均衡な生成・パルス列・per-class の
     細かい制御に向かない（_default_sim_signals は環境スナップショット用）。
   * とはいえ合成イディオムは sdr.SimBackend を踏襲する（帯域制限ノイズ=FFTマスク、
@@ -72,14 +81,110 @@ def _amp(snr_db: float) -> float:
 
 
 # ---------------------------------------------------------------------------
+# DC 残留線の注入（M2: 実測アライン）
+# ---------------------------------------------------------------------------
+# ゼロIF受信機は remove_dc 後も中心(0Hzオフセット)に弱い残留線を残す。実 captures は
+# dc_removed=True でも dsp.dc_spike_metrics の dc_excess_db が概ね [1.0, 4.25]dB
+# (10-90pct)・中央値~1.4・最大~10.8 に分布する（事前確認3で実測・ラベル不使用）。
+# 合成データには DC が無かったため M1.5 で CNN が「中心の細線」を cw-tone の手掛かりに
+# 誤用した（画像確認で確定した真犯人）。これを是正するため、**全クラスに同一分布で**
+# （クラスと無相関に）DC 残留を注入する。注入は IQ(時間領域)で行い凍結 spec.render を
+# 通す（画像への線の描き込みは禁止）。amp はノイズ標準偏差(=1)に対する相対値で、
+# dc_excess は相対dB＝絶対ゲイン非依存なので合成にそのまま較正できる。
+# 事前確認3の amp→dc_excess 較正:
+#   amp 0.03->1.0dB / 0.05->2.4dB / 0.065->3.8dB / 0.08->4.8dB / 0.16->~10dB
+DC_INJECT_PROB = 0.8                  # 注入確率（0.7〜0.9 の範囲）
+DC_AMP_MAIN = (0.025, 0.06)           # 主分布 → excess ~ [0.9, 3.0]dB（実測の低偏重に整合）
+DC_AMP_TAIL = (0.07, 0.16)            # 強テール → excess 最大~10dB（実測max10.8に対応）
+DC_TAIL_PROB = 0.12                   # テール（強め）に入る確率
+DC_DRIFT_HZ = 8e3                     # ゆっくりしたドリフト（DC帯 |f|<60kHz 内に収まる）
+DC_EXCESS_CAL_RANGE = (1.0, 4.25)     # 報告用: 実測10-90pctの目標域
+
+
+def _inject_dc_residual(iq: np.ndarray, rate: float, rng: np.random.Generator):
+    """中心(0Hz)に弱い DC 残留線を確率 DC_INJECT_PROB で注入する。
+
+    複素の微小オフセット + ゆっくりしたドリフト（remove_dc 後の残留を模す）。
+    クラスに依らず同一分布から引く（=識別の手掛かりにならない）。
+    returns: (iq, injected: bool, amp: float|None)
+    """
+    if rng.random() >= DC_INJECT_PROB:
+        return iq.astype(np.complex64), False, None
+    if rng.random() < DC_TAIL_PROB:
+        amp = float(rng.uniform(*DC_AMP_TAIL))
+    else:
+        amp = float(rng.uniform(*DC_AMP_MAIN))
+    f_drift = float(rng.uniform(-DC_DRIFT_HZ, DC_DRIFT_HZ))
+    phi = float(rng.uniform(0, 2 * np.pi))
+    t = np.arange(iq.size) / rate
+    dc = amp * np.exp(1j * (2 * np.pi * f_drift * t + phi))
+    return (iq + dc.astype(np.complex64)).astype(np.complex64), True, amp
+
+
+# ---------------------------------------------------------------------------
+# 時間エンベロープ（pulse-radar=周期 / wideband-ofdm=非周期 を明確に分離）
+# ---------------------------------------------------------------------------
+def _periodic_pulse_envelope(n: int, rng: np.random.Generator):
+    """pulse-radar 用: 厳密に周期的・短パルス・一様幅。returns (env, starts, lengths)。"""
+    npulse = int(rng.integers(6, 14))
+    pri = max(1, n // npulse)                  # 一定の繰返し間隔
+    plen = max(64, int(pri * float(rng.uniform(0.06, 0.14))))   # 一様幅
+    phase0 = int(rng.integers(0, pri))
+    env = np.zeros(n, dtype=np.float32)
+    starts: list[int] = []
+    k = 0
+    while True:
+        s = phase0 + k * pri
+        if s >= n:
+            break
+        env[s:min(s + plen, n)] = 1.0
+        starts.append(s)
+        k += 1
+    return env, starts, [plen] * len(starts)
+
+
+def _irregular_burst_envelope(n: int, rng: np.random.Generator):
+    """wideband-ofdm 用: 非周期・可変長・可変間隔のバースト列（実WiFiパケット様）。
+
+    pulse-radar と違い間隔も幅もランダム。returns (env, starts, lengths)。
+    """
+    env = np.zeros(n, dtype=np.float32)
+    starts: list[int] = []
+    lengths: list[int] = []
+    pos = int(rng.integers(0, max(1, n // 8)))
+    while pos < n:
+        blen = max(256, int(float(rng.uniform(0.025, 0.11)) * n))   # 可変長（長短混在）
+        end = min(pos + blen, n)
+        env[pos:end] = 1.0
+        starts.append(pos)
+        lengths.append(end - pos)
+        gap = max(128, int(float(rng.uniform(0.01, 0.18)) * n))     # 可変間隔（非周期）
+        pos = end + gap
+    return env, starts, lengths
+
+
+# ---------------------------------------------------------------------------
 # クラス別ジェネレータ: (iq, info) を返す。info は annotation 用の off/bw/snr。
 # off=None は「帯域全体 or 信号なし」（freq edges を付けない）。
+# DC 残留は generate() で全クラス一律に注入する（クラスと無相関）。
 # ---------------------------------------------------------------------------
 def _gen_wideband_ofdm(rng: np.random.Generator):
+    """実WiFi様（M2再定義）: 不規則間隔・可変幅の広帯域バースト列（12〜16MHz）。
+
+    M1 の「全時間持続の塊」を廃止。13ms 窓の実 WiFi はパケット通信ゆえ非周期で
+    可変幅の広帯域縦縞に見える（画像確認で確定したドメインギャップ）。pulse-radar
+    （厳密周期・短パルス・一様幅）との対比を保つ。
+    """
     snr = float(rng.uniform(15, 28))
     bw = float(rng.uniform(12e6, 16e6))
     off = float(rng.uniform(-0.08, 0.08) * RATE)
-    iq = _complex_noise(N, rng) + _amp(snr) * _bandlimited(N, RATE, off, bw, rng)
+    wide = _bandlimited(N, RATE, off, bw, rng)
+    env, starts, lengths = _irregular_burst_envelope(N, rng)
+    # 帯域内/バースト間の濃淡: バースト毎に振幅をふらつかせる（実WiFiの可変電力を模す）。
+    gain = env.copy()
+    for s, l in zip(starts, lengths):
+        gain[s:s + l] *= float(rng.uniform(0.6, 1.0))
+    iq = _complex_noise(N, rng) + _amp(snr) * (wide * gain)
     return iq.astype(np.complex64), dict(off=off, bw=bw, snr=snr)
 
 
@@ -99,25 +204,22 @@ def _gen_narrowband_burst(rng: np.random.Generator):
 
 
 def _gen_cw_tone(rng: np.random.Generator):
+    """連続波トーン（M2制約）: 中心から |offset| > 0.5MHz に置く。
+
+    注入される DC 残留線（中心0Hzの細線）と重ならないようにし、「中心の細線=
+    アーティファクト / 中心外の細線=cw-tone」を CNN が学べるようにする。
+    """
     snr = float(rng.uniform(18, 32))
-    off = float(rng.uniform(-0.35, 0.35) * RATE)
+    mag = float(rng.uniform(0.6e6, 0.35 * RATE))      # |off| >= 0.6MHz > 0.5MHz
+    off = mag if rng.random() < 0.5 else -mag
     iq = _complex_noise(N, rng) + _amp(snr) * _cw(N, RATE, off)
     return iq.astype(np.complex64), dict(off=off, bw=2e4, snr=snr)
 
 
 def _gen_pulse_radar(rng: np.random.Generator):
+    """レーダ様: 厳密に周期的・短パルス・一様幅の広帯域縦縞（wideband-ofdm と対比）。"""
     snr = float(rng.uniform(18, 32))
-    npulse = int(rng.integers(6, 14))
-    pri = max(1, N // npulse)               # パルス繰返し間隔（サンプル）
-    duty = float(rng.uniform(0.06, 0.14))
-    plen = max(64, int(pri * duty))
-    env = np.zeros(N, dtype=np.float32)
-    phase0 = int(rng.integers(0, pri))
-    for k in range(npulse + 1):
-        s = phase0 + k * pri
-        if s >= N:
-            break
-        env[s:min(s + plen, N)] = 1.0
+    env, _starts, _lengths = _periodic_pulse_envelope(N, rng)
     # パルス中は広帯域（ほぼ全帯域）→ 周期的な縦縞になる。
     wide = _bandlimited(N, RATE, 0.0, RATE * 0.9, rng)
     iq = _complex_noise(N, rng) + _amp(snr) * (wide * env)
@@ -183,6 +285,8 @@ def generate(out_dir: str, per_class: int = 80, seed: int = 0,
             rng = np.random.default_rng(children[k])
             k += 1
             iq, info = _GENERATORS[cls](rng)
+            # DC 残留線を全クラス一律（同一分布・クラス無相関）に注入する。
+            iq, dc_injected, dc_amp = _inject_dc_residual(iq, RATE, rng)
             # 中心周波数は 1〜6GHz から **クラスと独立に** 抽選する。
             # 「CNN は方式(見え方)を学び、用途は周波数で後段が導く」設計に従い、
             # クラスと周波数を相関させない（火入れの誠実さ）。
@@ -194,7 +298,10 @@ def generate(out_dir: str, per_class: int = 80, seed: int = 0,
                 "sigscan:synthetic_only": classes.SYNTHETIC_ONLY_TAG,
                 "sigscan:gen_seed": int(seed),
                 "sigscan:gen_index": int(k - 1),
+                "sigscan:dc_injected": bool(dc_injected),   # M2: DC残留注入の有無
             }
+            if dc_amp is not None:
+                extra_global["sigscan:dc_amp"] = round(float(dc_amp), 4)
             sigmf_io.write_recording(
                 base, iq, center_hz=center_hz, sample_rate=RATE,
                 annotations=[_annotation(cls, center_hz, info)],
