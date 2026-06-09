@@ -80,6 +80,25 @@ def _reason_type2(r, thr: float) -> str:
             f"（電子レンジ発見の原型）")
 
 
+def _clear_stale(out_dir: str) -> None:
+    """前回のスポットライト出力（PNG + report）を削除して上書きを実現する。
+
+    安全策: **専用ディレクトリ（末尾が _spotlight）でのみ** 実行する。誤って
+    captures/_images 等を指していた場合は何もしない（元画像を消さないため）。
+    削除対象は spotlight が生成する派生物のみ（*.png / spotlight_report.*）で、
+    実データ(*.sigmf-*)には一切触れない。
+    """
+    if os.path.basename(os.path.normpath(out_dir)) != "_spotlight":
+        return
+    import glob
+    for f in (glob.glob(os.path.join(out_dir, "*.png"))
+              + glob.glob(os.path.join(out_dir, "spotlight_report.*"))):
+        try:
+            os.remove(f)
+        except OSError:
+            pass
+
+
 def _render_png(base_path: str, out_path: str) -> bool:
     """view_captures.render_one を再利用して spec.render 経由の PNG を書く。
 
@@ -105,6 +124,8 @@ def run_spotlight(data_dir: str, ckpt_path: str, out_dir: str,
     sel = select_spotlight(res.records, type1_conf_thr=type1_conf_thr,
                            type2_cnn_thr=type2_cnn_thr, top_n=top_n)
     os.makedirs(out_dir, exist_ok=True)
+    if render:
+        _clear_stale(out_dir)        # 「上書き」: 前回のスポットライト出力を一掃
 
     # 候補（ユニークなファイル）を PNG 化（重複レンダ回避）。
     entries = []
