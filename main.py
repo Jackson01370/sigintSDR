@@ -108,6 +108,16 @@ def main():
                    metavar="LEVEL",
                    help="Sim診断: 取得IQ中央にDCスパイク(DCオフセット由来の細い線)を注入"
                         "(既定強度0.5)。品質ゲートのDCスパイク除外の確認用")
+    # --- CNN 分類器（3段分類器の 2 段目＝監査役。既定 OFF）---
+    p.add_argument("--cnn", action="store_true",
+                   help="CNN監査(2段目分類器)を有効化。滞在観測の保存候補IQを凍結"
+                        "spec.render経由でCNNに通し、ルール×CNN×文脈の整合チェックで"
+                        "確信度を調整する(既定OFF)。--dwell 併用前提")
+    p.add_argument("--cnn-checkpoint", default="runs/m2_5", metavar="PATH",
+                   dest="cnn_checkpoint",
+                   help="CNNチェックポイント(.pt またはそれを含むDIR。既定 runs/m2_5)。"
+                        "--cnn 有効かつ不在は明示エラー")
+
     p.add_argument("--quiet", action="store_true")
     args = p.parse_args()
 
@@ -152,6 +162,11 @@ def main():
         cfg.quality.dc_excess_std_max = args.q_dc_std
     if args.no_quality_gate:
         cfg.quality.enabled = False
+    # CNN 監査（既定 OFF）。--cnn で有効化、--cnn-checkpoint でモデル指定。
+    if args.cnn:
+        cfg.cnn.enabled = True
+    if args.cnn_checkpoint is not None:
+        cfg.cnn.checkpoint = args.cnn_checkpoint
 
     mode = "HackRF実機" if args.hardware else "シミュレーション"
     print(f"sigscan  mode={mode}  "
@@ -175,6 +190,9 @@ def main():
               f"観測間隔 {cfg.dwell.obs_interval_s:g}s / 品質ゲート={gate}")
     if args.collect:
         print(f"収集モード: SigMF を {args.collect}/ に保存 (SNR>={args.collect_snr}dB)")
+    if cfg.cnn.enabled:
+        # スケジューラ構築が成功＝チェックポイントのロードに成功した後に表示する。
+        print(f"CNN分類器: 有効 ({cfg.cnn.checkpoint}) [監査役/2段目]")
     try:
         sched.run(once=args.once, verbose=not args.quiet)
     finally:

@@ -39,55 +39,12 @@ import spec
 import dataset as ds_mod
 from cnntrain import infer
 
-
-# ===========================================================================
-# (1) 期待対応表（用途軸ラベル → 期待される方式軸クラス集合）  ★ [仮説] ★
-# ===========================================================================
-# これは「地図上の仮説」である。画像確認と将来の人間レビューで更新する前提。
-# 一致は accuracy ではない（用途軸 vs 方式軸の照合）。集合なのは、1 つの用途が
-# 複数の見え方を取りうるため（帯域幅・バースト性で分かれる）。
-@dataclass(frozen=True)
-class ExpectedRow:
-    keywords: tuple        # ラベル(小文字)に対する部分一致キーワード（いずれか一致で採用）
-    expect: frozenset      # 期待される方式クラス（spec/方式軸）の集合
-    rationale: str         # この対応の根拠（[仮説]）
-
-
-# 事前確認3で captures/ に実在する全ラベルをカバーする:
-#   "BLE/Bluetooth (adv?)" / "WiFi (2.4GHz, 20/40MHz)" / "Zigbee/独自2.4G"
-EXPECTED_REAL: list[ExpectedRow] = [
-    ExpectedRow(
-        ("ble", "bluetooth"),
-        frozenset({"narrowband-burst"}),
-        "[仮説] BLE adv は ~2MHz 以下の狭帯域バースト → narrowband-burst を期待。"
-        "ただし保存は約13msの切り取りで、まばらなバーストが窓に未着なら画像は"
-        "ノイズのみ → noise-only が出うる（=13msくじ引きの証拠としてカウント）。"),
-    ExpectedRow(
-        ("wifi",),
-        frozenset({"wideband-ofdm"}),
-        "[仮説] WiFi 2.4GHz 20/40MHz は OFDM の広帯域ブロック → wideband-ofdm を期待。"
-        "実画像が細線寄りなら cw-tone が出る可能性もあり（ラベル監査の観点）。"),
-    ExpectedRow(
-        ("zigbee", "独自"),
-        frozenset({"narrowband-burst", "wideband-ofdm"}),
-        "[仮説] Zigbee は ~2MHz O-QPSK（狭め）だが『独自2.4G』が混在しうるため、"
-        "narrowband-burst と wideband-ofdm の集合で受ける。"),
-]
-
-EXPECTED_DISCLAIMER = (
-    "期待対応表は [仮説]（用途軸→方式軸の地図）。画像確認・人間レビューで更新する。"
-    "照合の一致は accuracy ではない。")
-
-
-def match_expected(label: str | None,
-                   table: list[ExpectedRow] | None = None) -> tuple[frozenset | None, str]:
-    """ラベル → (期待方式クラス集合, 根拠)。未対応は (None, '')（=unmapped）。"""
-    table = EXPECTED_REAL if table is None else table
-    lab = (label or "").lower()
-    for row in table:
-        if any(k.lower() in lab for k in row.keywords):
-            return row.expect, row.rationale
-    return None, ""
+# 期待対応表は cnntrain.expected に一元化（M3 で classify 監査と共有・二重定義禁止）。
+# probe からは従来どおり probe.ExpectedRow / probe.EXPECTED_REAL / probe.match_expected
+# として参照できるよう **再エクスポート** する（既存の参照・テストを壊さない）。
+from cnntrain.expected import (   # noqa: F401  (re-export)
+    ExpectedRow, EXPECTED_REAL, EXPECTED_DISCLAIMER, match_expected,
+)
 
 
 # ===========================================================================

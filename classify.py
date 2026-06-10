@@ -112,8 +112,108 @@ def rule_based(measurement: dict, bands: list[Band]) -> ClassResult:
 # ステップ2/3: フック（未実装 → None を返して劣化動作）
 # ---------------------------------------------------------------------------
 def cnn_classify(spectrogram_db) -> ClassResult | None:
-    """CNN 推論フック。学習済みモデル導入後にここを実装。"""
+    """CNN 推論フック（旧・スペクトログラム経路。常に None＝劣化動作）。
+
+    M3 の CNN 監査は本フックではなく、下の CNN 監査コンテキスト経由で
+    凍結 spec.render（infer.classify_iq）を通して行う（新たな前処理を作らない）。
+    本スタブは従来挙動（spectrogram_db を渡しても rule のまま）を保つため残す。
+    """
     return None
+
+
+# ---------------------------------------------------------------------------
+# ステップ2: CNN 監査コンテキスト（既定 OFF。set されない限り classify は従来と
+#   完全に同一の出力）。
+#   凍結シグネチャ classify.classify(...) を変えずに IQ/rate を 2 段目へ渡すための、
+#   作業指示が明示的に許可した「オプショナルなコンテキスト設定関数」方式。単一
+#   スレッドのスケジューラが各信号の直前に set し、直後に clear する。torch を引く
+#   cnntrain.infer は **本コンテキストが set されたときだけ遅延 import** される
+#   （OFF 運用・torch 無し環境で classify は壊れない＝禁止事項3）。
+# ---------------------------------------------------------------------------
+@dataclass
+class CNNAuditContext:
+    checkpoint: object            # cnntrain.infer.Checkpoint（型注釈で torch を引かない）
+    iq: object                    # 生 IQ（complex64 配列等）
+    rate: float
+    center_hz: float
+    checkpoint_name: str = ""     # 来歴記録用（ファイル名で可）
+    provenance: dict | None = None    # 監査後に classify が埋める（呼び出し側が SigMF へ）
+    decision: object = None           # AuditDecision（テスト・デバッグ用）
+
+
+_cnn_ctx: "CNNAuditContext | None" = None
+
+
+def set_cnn_context(ctx: "CNNAuditContext | None") -> None:
+    """次の classify() 呼び出しで使う CNN 監査コンテキストを設定する。
+
+    呼ばない/None を渡す限り classify は従来挙動（CNN 段は完全にスキップ）。
+    """
+    global _cnn_ctx
+    _cnn_ctx = ctx
+
+
+def clear_cnn_context() -> None:
+    """CNN 監査コンテキストを解除する（classify 呼び出し後に必ず呼ぶ）。"""
+    global _cnn_ctx
+    _cnn_ctx = None
+
+
+def _run_cnn_audit(r: ClassResult, measurement: dict,
+                   ctx: CNNAuditContext) -> ClassResult:
+    """ルール結果 r を CNN 所見で監査し、確信度調整・(C)で Unknown 化して返す。
+
+    torch を引く cnntrain.infer は **ここで遅延 import**（CNN 有効時のみ）。
+    凍結 spec.render を通すため infer.classify_iq を再利用する（新前処理なし）。
+    """
+    from cnntrain import infer           # torch を引く: CNN 有効時のみ
+    from cnntrain import audit as _audit
+
+    cnn_class, cnn_conf = infer.classify_iq(ctx.checkpoint, ctx.iq, ctx.rate)
+    center = measurement.get("center_hz")
+    decision = _audit.audit(r.label, r.confidence, cnn_class, cnn_conf,
+                            center_hz=center)
+
+    # 来歴（SigMF 用。呼び出し側＝scheduler が extra_global に載せる）。
+    # 調整前後の確信度が追えること（rule_conf_pre / cnn_conf_post）。
+    ctx.decision = decision
+    ctx.provenance = {
+        "sigscan:cnn_class": cnn_class,
+        "sigscan:cnn_conf": round(float(cnn_conf), 3),
+        "sigscan:cnn_verdict": decision.verdict,
+        "sigscan:cnn_checkpoint": ctx.checkpoint_name,
+        "sigscan:rule_conf_pre": round(float(r.confidence), 3),
+        "sigscan:cnn_conf_post": round(float(decision.conf_after), 3),
+    }
+    return _apply_cnn_decision(r, decision)
+
+
+def _apply_cnn_decision(r: ClassResult, decision) -> ClassResult:
+    """AuditDecision を ClassResult に反映（純粋な field 操作）。
+
+    大原則: CNN の判定だけで用途ラベルを書き換えない。(C) は Unknown 化のみで、
+    元ラベルは candidates に残し、人間判断（review.py）へ回す。
+    """
+    conf = round(float(decision.conf_after), 2)
+    tag = (f"[CNN監査:{decision.verdict} "
+           f"{decision.cnn_class}@{decision.cnn_conf:.2f}]")
+    notes = (r.notes + " " + tag).strip() if r.notes else tag
+
+    # unmapped: 期待対応表に用途が無い → ラベル・確信度・method はそのまま（所見のみ）。
+    if decision.verdict == "unmapped":
+        return ClassResult(r.label, r.confidence, r.method, notes,
+                           list(r.candidates))
+
+    # (C) かつ <0.7: 用途を Unknown に落とす（元ラベルを候補に残す）。method=cnn。
+    if decision.to_unknown:
+        cands = list(r.candidates)
+        if r.label not in cands:
+            cands = [r.label] + cands
+        return ClassResult(UNKNOWN, conf, "cnn",
+                           notes + " → 用途=Unknown(候補つき)", cands)
+
+    # (A)/(B)/(C≥0.7): ラベル維持・確信度のみ調整。method=cnn（CNN が監査・調整）。
+    return ClassResult(r.label, conf, "cnn", notes, list(r.candidates))
 
 
 def llm_classify(spectrogram_png_path: str | None,
@@ -148,6 +248,13 @@ def classify(measurement: dict, bands: list[Band],
     r = rule_based(measurement, bands)
     if r.confidence >= 0.85:
         return r
+
+    # ステップ2: CNN 監査（既定 OFF。コンテキストが set されたときのみ）。
+    #   ルール結果を CNN 所見で監査し、確信度を調整（(C) で Unknown 化）する。
+    #   ここを通った後の r.confidence を 3段目 LLM のトリガが見る＝自然に直列
+    #   （CNN で確信度が 0.5 未満まで下がれば既存の LLM トリガが発火する）。
+    if _cnn_ctx is not None:
+        r = _run_cnn_audit(r, measurement, _cnn_ctx)
 
     if spectrogram_db is not None:
         c = cnn_classify(spectrogram_db)

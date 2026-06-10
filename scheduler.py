@@ -49,6 +49,20 @@ class HybridScheduler:
         # 出口で除外する（関所は1点のみ）。収集記録には来歴として SigMF global に
         # sigscan:band_focus を残す（dc_removed と同じ流儀）。既定 OFF で挙動不変。
         self._band_focus = bool(cfg.scan.band_focus)
+        # CNN 監査（3段分類器の 2 段目＝監査役）。既定 OFF（挙動不変）。
+        #   有効時のみチェックポイントを 1 度だけロードし、滞在観測の保存候補の IQ を
+        #   classify のステップ2（CNN 監査）に通す。torch を引く cnntrain.infer は
+        #   **有効時のみ遅延 import**（OFF/torch 無し環境を壊さない＝禁止事項3）。
+        #   フラグ ON かつチェックポイント不在は明示エラー（黙ってスキップしない）。
+        cnn_cfg = getattr(cfg, "cnn", None)
+        self._cnn_enabled = bool(cnn_cfg is not None and cnn_cfg.enabled)
+        self._cnn_ckpt = None
+        self._cnn_ckpt_name = ""
+        if self._cnn_enabled:
+            ckpt_path = self._resolve_cnn_checkpoint(cnn_cfg.checkpoint)
+            from cnntrain import infer        # torch を引く: CNN 有効時のみ
+            self._cnn_ckpt = infer.load_checkpoint(ckpt_path)
+            self._cnn_ckpt_name = os.path.basename(ckpt_path)
         self._last_survey = 0.0
         self._segments: list[dict] = []
         # ホットバンドを優先度の重み付きで巡回するためのイテレータ
@@ -60,6 +74,23 @@ class HybridScheduler:
             os.makedirs(cfg.scan.spectrogram_dir, exist_ok=True)
         if self.collect_dir:
             os.makedirs(self.collect_dir, exist_ok=True)
+
+    # --- CNN チェックポイント解決 ---
+    @staticmethod
+    def _resolve_cnn_checkpoint(path: str) -> str:
+        """チェックポイントのパスを解決する。
+
+        ディレクトリなら中の checkpoint.pt を補完。解決後に実在しなければ
+        **明示エラー**（フラグ ON での不在を黙ってスキップしない＝作業指示）。
+        """
+        p = path
+        if os.path.isdir(p):
+            p = os.path.join(p, "checkpoint.pt")
+        if not os.path.isfile(p):
+            raise FileNotFoundError(
+                f"CNN分類器(--cnn)が有効ですが、チェックポイントが見つかりません: "
+                f"{p}（--cnn-checkpoint で指定。無効化するには --cnn を外す）")
+        return p
 
     # --- フォーカス来歴 ---
     def _focus_global(self) -> dict:
@@ -188,21 +219,31 @@ class HybridScheduler:
         return m, result
 
     # --- 滞在観測モード ---
-    def _save_dwell(self, obs, m: dict, verdict, result, target: dict) -> None:
-        """品質ゲートを通った滞在観測を SigMF 保存し、品質メタを annotation に記録。"""
+    def _save_dwell(self, obs, m: dict, verdict, result, target: dict,
+                    cnn_prov: dict | None = None) -> None:
+        """品質ゲートを通った滞在観測を SigMF 保存し、品質メタを annotation に記録。
+
+        cnn_prov: CNN 監査の来歴（sigscan:cnn_* キー）。None なら従来どおり
+        （extra_global は不変＝OFF 時の保存出力は完全に同一）。
+        """
         ann = sigmf_io.annotation_from_result(m, result)
         name = (f"{int(round(obs.center_hz/1e6))}MHz_"
                 f"{int(time.time()*1000)}_{self._collected}")
         base = os.path.join(self.collect_dir, name)
+        extra_global = {"sigscan:rep_version": spec.SIGSCAN_REP_VERSION,
+                        "sigscan:target_src": target.get("src", ""),
+                        "sigscan:capture_mode": "dwell",
+                        "sigscan:dc_removed": self._dc_removed,
+                        **self._focus_global()}
+        if cnn_prov:
+            # 凍結 write_recording は extra_global を global にそのまま展開する
+            # （dc_removed と同じ流儀）。sigmf_io シグネチャは不変のまま来歴を付与。
+            extra_global.update(cnn_prov)
         sigmf_io.write_recording(
             base, obs.best_iq, obs.center_hz, self.cfg.sdr.dwell_rate_hz,
             annotations=[ann], hw=self._hw,
             description=f"sigscan dwell-collect; rep={spec.SIGSCAN_REP_VERSION}",
-            extra_global={"sigscan:rep_version": spec.SIGSCAN_REP_VERSION,
-                          "sigscan:target_src": target.get("src", ""),
-                          "sigscan:capture_mode": "dwell",
-                          "sigscan:dc_removed": self._dc_removed,
-                          **self._focus_global()},
+            extra_global=extra_global,
         )
         # 凍結 write_recording は annotation の任意キーを通さないため、書き出し後に
         # 品質メタ（sigscan:）を annotation へ最小限 patch する（生IQには触れない）。
@@ -251,17 +292,34 @@ class HybridScheduler:
                     m["bw_hz"] = float(t["bw"])
                 m["snr_db"] = max(m["snr_db"], float(t.get("snr", 0.0)))
 
-            result = classify.classify(m, c.bands)
+            # 保存候補か（品質合格 × SNR 下限 × 収集先あり）。CNN 監査は **保存候補の
+            # IQ に対してのみ** 走らせる（サーベイ段では呼ばない＝IQ 無し・重い）。
+            is_candidate = (self.collect_dir is not None and verdict.passed
+                            and m["snr_db"] >= self.collect_snr_min)
+            cnn_prov = None
+            if self._cnn_enabled and is_candidate:
+                ctx = classify.CNNAuditContext(
+                    checkpoint=self._cnn_ckpt, iq=obs.best_iq,
+                    rate=c.sdr.dwell_rate_hz, center_hz=obs.center_hz,
+                    checkpoint_name=self._cnn_ckpt_name)
+                classify.set_cnn_context(ctx)
+                try:
+                    result = classify.classify(m, c.bands)
+                finally:
+                    classify.clear_cnn_context()      # 必ず解除（次信号へ漏らさない）
+                cnn_prov = ctx.provenance
+            else:
+                result = classify.classify(m, c.bands)
             if self.store:
                 self.store.log(m, result)
 
             saved = False
-            if (self.collect_dir and verdict.passed
-                    and m["snr_db"] >= self.collect_snr_min):
+            if is_candidate:
                 if self._recently_collected(obs.center_hz, m["bw_hz"]):
                     self._skipped_dup += 1
                 else:
-                    self._save_dwell(obs, m, verdict, result, t)
+                    self._save_dwell(obs, m, verdict, result, t,
+                                     cnn_prov=cnn_prov)
                     saved = True
 
             outcomes.append(dict(obs=obs, m=m, result=result,

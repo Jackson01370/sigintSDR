@@ -129,6 +129,18 @@ class QualityConfig:
 
 
 # ---------------------------------------------------------------------------
+# CNN 分類器（3段分類器の 2 段目＝監査役）— 既定 OFF（挙動不変）
+#   有効時のみ、滞在観測で保存候補になった信号の IQ を凍結 spec.render 経由で
+#   CNN に通し、ルール × CNN × バンドプラン文脈の整合チェックで確信度を調整する。
+#   checkpoint はディレクトリ（中の checkpoint.pt を補完）でもファイルでも可。
+# ---------------------------------------------------------------------------
+@dataclass
+class CNNConfig:
+    enabled: bool = False
+    checkpoint: str = "runs/m2_5"
+
+
+# ---------------------------------------------------------------------------
 # バンドプラン（1〜6GHz・日本の割当を考慮）
 #   priority: 大きいほどドウェル頻度を上げる
 #   hint    : ルールベース分類のヒント（表示/LLM文脈用の自由文字列。機械可読の
@@ -218,4 +230,5 @@ class Config:
     scan: ScanConfig = field(default_factory=ScanConfig)
     dwell: DwellConfig = field(default_factory=DwellConfig)
     quality: QualityConfig = field(default_factory=QualityConfig)
+    cnn: CNNConfig = field(default_factory=CNNConfig)
     bands: list[Band] = field(default_factory=lambda: list(BAND_PLAN))
