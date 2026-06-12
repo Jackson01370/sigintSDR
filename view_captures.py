@@ -10,7 +10,8 @@
 画像の作り方は凍結契約 spec.render と同じ正準表現に合わせる（学習でAIが見るのと同じ絵）。
 
 依存: numpy, matplotlib。プロジェクトの spec.py / sigmf_io.py をそのまま使う
-（どちらも変更しない・読み取るだけ）。Windows(cp932)でも文字化けしないよう英字主体。
+（どちらも変更しない・読み取るだけ）。用途ラベルは日本語をそのまま表示する
+（コンソールは UTF-8 強制、PNG タイトルは和文フォントへのフォールバックで対応）。
 """
 from __future__ import annotations
 import argparse
@@ -48,14 +49,63 @@ def _meta_summary(meta: dict) -> dict:
         "rate": float(g.get("core:sample_rate", spec.CAPTURE_RATE_HZ) or spec.CAPTURE_RATE_HZ),
         "hw": str(g.get("core:hw", "?")),
         "center": center,
-        "label": str(a.get("core:description", a.get("label", "")) or ""),
+        # 用途ラベル: sigmf_io.write_recording は annotation の core:label に書く
+        "label": str(a.get("core:label", a.get("core:description", a.get("label", ""))) or ""),
         "confidence": a.get("sigscan:confidence"),
         "method": a.get("sigscan:method"),
         "snr_db": a.get("sigscan:snr_db"),
         "persistence": a.get("sigscan:persistence"),
         "spur": a.get("sigscan:spur_suspect"),
         "bw_hz": (float(hi) - float(lo)) if (lo is not None and hi is not None) else None,
+        # CNN 監査来歴（M3 以降の記録のみ global に載る。古い記録は None）
+        "cnn_verdict": g.get("sigscan:cnn_verdict"),
+        "cnn_class": g.get("sigscan:cnn_class"),
+        "cnn_conf": g.get("sigscan:cnn_conf"),
     }
+
+
+def label_text(info: dict) -> str:
+    """一覧行・PNG タイトルに出すラベル文字列を組み立てる（純関数）。
+
+    _meta_summary の戻り値から「用途ラベル + CNN 監査来歴」を1行にする。
+    例: `未識別信号  [CNN:C-conflict cnn=noise-only@0.47]`
+    CNN 来歴の無い古い記録はラベルのみ、ラベルも無ければ "(no label)"
+    （後方互換: どのキーが欠けてもエラーにしない）。
+    """
+    text = str(info.get("label") or "") or "(no label)"
+    verdict = info.get("cnn_verdict")
+    if not verdict:
+        return text
+    cnn = f"CNN:{verdict}"
+    if info.get("cnn_class"):
+        cnn += f" cnn={info['cnn_class']}"
+        if info.get("cnn_conf") is not None:
+            try:
+                cnn += f"@{float(info['cnn_conf']):.2f}"
+            except (TypeError, ValueError):
+                pass
+    return f"{text}  [{cnn}]"
+
+
+def _title_font_family() -> list:
+    """PNG タイトル用のフォント列。和文ラベルが豆腐(□)にならないための表示時対処。
+
+    既定の DejaVu Sans を先頭に保ち（英数字は従来どおり）、インストール済みの
+    和文フォントを1つだけ後ろに足す。matplotlib>=3.6 のグリフ単位フォールバックで
+    和文グリフのみ和文フォントで描かれる。見つからなければ既定のまま（従来挙動）。
+    """
+    try:
+        from matplotlib import font_manager
+        installed = {f.name for f in font_manager.fontManager.ttflist}
+    except Exception:
+        return ["sans-serif"]
+    fam = [n for n in ("DejaVu Sans",) if n in installed]
+    for name in ("Yu Gothic", "Meiryo", "MS Gothic", "BIZ UDGothic",
+                 "Noto Sans CJK JP", "IPAexGothic", "IPAGothic"):
+        if name in installed:
+            fam.append(name)
+            break
+    return fam or ["sans-serif"]
 
 
 def render_one(base: str, out_path: str, flatten_dc: bool = False) -> dict:
@@ -97,9 +147,9 @@ def render_one(base: str, out_path: str, flatten_dc: bool = False) -> dict:
     title = f"{cen:.1f} MHz"
     if bw:
         title += f"  BW~{bw:.1f} MHz"
-    if info["label"]:
-        title += f"\n{info['label']}"
-    axL.set_title(title, fontsize=10)
+    if info["label"] or info.get("cnn_verdict"):
+        title += f"\n{label_text(info)}"
+    axL.set_title(title, fontsize=10, fontfamily=_title_font_family())
 
     # 右: 平均スペクトル（横=パワー, 縦=周波数）
     axR.plot(spectrum, freqs_mhz, color="#1f77b4")
@@ -156,7 +206,7 @@ def main(argv=None) -> int:
         out_path = os.path.join(out_dir, name + ".png")
         try:
             info = render_one(base, out_path, flatten_dc=args.flatten_dc)
-            tag = info["label"] or "(no label)"
+            tag = label_text(info)
             print(f"  OK  {name}.png   {info['center']/1e6:.1f}MHz  {tag}")
             ok += 1
         except Exception as e:  # noqa: BLE001 - 1件失敗で全体を止めない

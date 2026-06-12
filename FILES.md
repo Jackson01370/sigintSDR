@@ -22,6 +22,7 @@ sigintSDR/                ← プロジェクトの一番上
 ├─ FILES.md               ← この地図
 ├─ README.md              ← プロジェクトの説明
 ├─ CONTRACT.md            ← 「約束ごと（凍結ルール）」
+├─ KNOWN_ISSUES.md        ← 既知の課題（気づいたがまだ直していないこと）
 ├─ AGENTS.md              ← ロボットたちの動かし方
 ├─ requirements.txt       ← 必要な部品リスト
 ├─ worktrees.sh           ← 並列作業の補助
