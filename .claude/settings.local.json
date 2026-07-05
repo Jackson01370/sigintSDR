@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python *)",
+      "Bash(echo \"RC=$?\")",
+      "Bash(where python *)",
+      "Bash(py --list)",
+      "Bash(PYTHONIOENCODING=utf-8 python main.py --sim --collect captures/ --once)",
+      "Bash(PYTHONIOENCODING=utf-8 python -m dataset stats captures/)",
+      "Bash(PYTHONIOENCODING=utf-8 python -c ' *)",
+      "Bash(PYTHONIOENCODING=utf-8 python -m pytest -q)",
+      "Bash(PYTHONIOENCODING=utf-8 python -m dataset query captures/ --hw sim --snr-min 30)",
+      "Bash(PYTHONIOENCODING=utf-8 python review.py captures/ --list)",
+      "Bash(PYTHONIOENCODING=utf-8 python -m dataset review captures/)",
+      "Bash(echo \"EXIT=$?\")",
+      "WebFetch(domain:github.com)"
+    ]
+  }
+}

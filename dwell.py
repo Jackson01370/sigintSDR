@@ -119,6 +119,14 @@ def observe_dwell(backend, center_hz: float, rate: float, n_samples: int,
 
     dc_arr = np.asarray(dc_excess, dtype=float)
 
+    # bw_median の母集団を「検出された観測」に限定する。BLE 等の間欠バーストでは
+    # 滞在中の過半が quiet 窓（合間の細い CW 線だけ等）になり、全観測 median だと
+    # 幅が ~1 FFT ビンに潰れて代表性を失う。既存の detected（det_snr>=detect_snr_db）
+    # を再利用し、検出観測の bw の median を採る。検出が 0 件（終始 quiet 等）のときは
+    # 従来どおり全観測 median にフォールバックする（None/例外にしない）。
+    bw_pop = bw_arr[detected] if detected.any() else bw_arr
+    bw_median = float(np.median(bw_pop))
+
     return DwellObservation(
         center_hz=float(center_hz),
         target_src=target_src,
@@ -130,7 +138,7 @@ def observe_dwell(backend, center_hz: float, rate: float, n_samples: int,
         snr_std_db=float(det_snr.std()),
         snr_detect_mean_db=float(det_vals.mean()) if det_vals.size else 0.0,
         bw_rep_hz=float(best["bw_hz"]),
-        bw_median_hz=float(np.median(bw_arr)),
+        bw_median_hz=bw_median,
         occupied_frac_rep=float(best.get("occupied_frac", 0.0)),
         peak_db_rep=float(best["peak_db"]),
         noise_ref_db=noise_ref,

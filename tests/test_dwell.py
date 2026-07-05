@@ -147,6 +147,58 @@ def test_noise_floor_override_changes_detection():
 
 
 # ---------------------------------------------------------------------------
+# 案3: bw_median_hz の母集団を「全観測」から「検出された観測」に限定する。
+#   BLE 等の間欠バーストでは滞在中の過半が quiet 窓になり、全観測 median だと幅が
+#   ~1 FFT ビン(や 0)に潰れて代表性を失う。既存の detected(det_snr>=detect_snr_db)を
+#   再利用して検出観測の bw の median を採り、検出 0 件なら全観測にフォールバックする。
+# ---------------------------------------------------------------------------
+class _BurstBackend:
+    """present で ~1.5MHz 幅の帯域制限バースト、absent でノイズのみを返す。
+
+    バーストは検出マージンが高く『検出』に、ノイズ窓は低マージンで『未検出』になる
+    （案3 が検出観測だけで median を採ることの検証用）。
+    """
+    def __init__(self, present_flags, seed=0):
+        self.flags = list(present_flags)
+        self.k = 0
+        self.rng = np.random.default_rng(seed)
+
+    def capture_iq(self, center_hz, rate, n):
+        present = self.flags[self.k % len(self.flags)]
+        self.k += 1
+        noise = (0.01 * (self.rng.normal(size=n)
+                         + 1j * self.rng.normal(size=n))).astype(np.complex64)
+        if not present:
+            return noise                                     # quiet窓(未検出・bw≈0)
+        f = np.fft.fftfreq(n, d=1.0 / rate)
+        s = self.rng.normal(size=n) + 1j * self.rng.normal(size=n)
+        s[np.abs(f - 2e6) > 0.75e6] = 0.0                    # +2MHz中心 ~1.5MHz幅
+        b = np.fft.ifft(s)
+        b = b / np.std(b)
+        return (b + noise).astype(np.complex64)
+
+
+def test_bw_median_uses_detected_observations():
+    """間欠バースト+quietノイズ窓の多観測列で、bw_median が検出観測(バースト)の
+    実幅を代表し、quiet 窓の bw≈0 に潰れない（案3）。"""
+    flags = [True, False, False, True, False, False, False, False, False, False]  # 2/10
+    obs = dwell.observe_dwell(_BurstBackend(flags), 2.433e9, RATE, N,
+                              _fixed_counts_cfg(10), QualityConfig())
+    assert obs.n_detect == 2                       # バースト2回のみ検出
+    assert obs.bw_median_hz > 1e6                  # 検出観測(~1.5MHz)を代表
+    # 全観測 median なら quiet 窓(bw≈0)に支配され極小になる（旧挙動との差）。
+    assert float(np.median(np.asarray(obs.bw_series))) < 0.5e6
+
+
+def test_bw_median_fallback_when_no_detection():
+    """検出0件(終始 quiet)なら全観測 median にフォールバックする（None/例外にしない）。"""
+    obs = dwell.observe_dwell(_BurstBackend([False]), 2.433e9, RATE, N,
+                              _fixed_counts_cfg(6), QualityConfig())
+    assert obs.n_detect == 0
+    assert obs.bw_median_hz == float(np.median(np.asarray(obs.bw_series)))
+
+
+# ---------------------------------------------------------------------------
 # DCスパイク（DCオフセット由来の中央スパイク）指標の集計
 #   各取得IQから中央集中度(dc_excess)を測り、平均(中央集中)と std(時間不変性)を
 #   集計する。これを quality.py が dc_spike 破棄に使う。

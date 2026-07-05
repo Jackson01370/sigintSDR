@@ -94,6 +94,51 @@ def test_measure_signal_tone():
 
 
 # ---------------------------------------------------------------------------
+# 案1: measure_signal.bw_hz を「活性ビンの最外殻の差(max-min span)」から
+#   「主ピークを含む連続占有帯の幅」へ。窓内に離れた2信号があるとき、間の不活性
+#   ノイズごと跨いで過大化するのを是正する（対症療法。根治=複数信号分離は task#6）。
+# ---------------------------------------------------------------------------
+def _two_separated_signals(seed=3):
+    """離れた2信号: 主ピーク=+2MHz中心 ~1.5MHz幅の強バースト + -8MHz の弱い細いCW線。
+    旧定義 max-min span だと間の不活性ノイズごと跨いで ~10MHz に膨張する配置。"""
+    rng = np.random.default_rng(seed)
+    t = np.arange(N) / RATE
+    cw = 0.02 * np.exp(-2j * np.pi * 8e6 * t)                # 弱い細いCW @ -8MHz
+    freq = np.fft.fftfreq(N, d=1.0 / RATE)
+    s = rng.normal(size=N) + 1j * rng.normal(size=N)
+    s[np.abs(freq - 2e6) > 0.75e6] = 0.0                    # +2MHz中心 ±0.75MHz(=1.5MHz幅)
+    burst = np.fft.ifft(s)
+    burst = burst / np.std(burst)                            # 強いバースト(=主ピーク)
+    noise = 0.01 * (rng.normal(size=N) + 1j * rng.normal(size=N))
+    return (burst + cw + noise).astype(np.complex64)
+
+
+def test_measure_signal_two_signals_no_straddle():
+    """離れた2信号(細いCW + 狭バースト)で bw_hz が主ピーク信号の実幅に収まり、
+    2信号を跨がない（案1: max-min span → 連続占有帯）。"""
+    iq = _two_separated_signals()
+    m = dsp.measure_signal(iq, RATE, 2.433e9)
+    assert m["bw_hz"] < 3e6            # 主ピーク(~1.5MHz)の実幅。跨ぐと ~10MHz になる
+    assert m["occupied_frac"] < 0.85   # 帯域を埋めていない（広帯域分岐に入らない）
+    # 同一PSDで旧定義(max-min span)なら 8MHz超に膨張していたことを確認（是正の証拠）。
+    freqs, p = dsp.welch_psd(iq, RATE)
+    active = freqs[p > np.percentile(p, 20) + 6.0]
+    assert (active.max() - active.min()) > 8e6
+
+
+def test_measure_signal_wideband_contiguous_stays_wide():
+    """連続する中広帯域(±5MHz)は案1でも狭められず広いまま（非退行）。
+
+    案1 は『離れた2山を跨ぐ』ケースだけを是正し、連続帯では主ピークからの連続ランが
+    帯域全体に伸びるため従来どおり広く測れる。注: 帯域を完全に埋める信号は床(P20)が
+    信号内に沈み occupied→0・bw→0 になる既存の限界があり、`occupied_frac>0.85 → bw=rate`
+    分岐は保持のみ（floor=P20 ゆえ occupied は理論上 ≤0.80 で到達しないが、本タスクは
+    測る側の2点のみ修正のため分岐コードは不変）。"""
+    m = dsp.measure_signal(_band_limited_noise(half_bw_hz=5e6), RATE, 2.44e9)
+    assert m["bw_hz"] > 8e6            # ~10MHz。連続帯なので狭まらない
+
+
+# ---------------------------------------------------------------------------
 # DCスパイク（DCオフセット由来の中央スパイク）測定
 #   ゼロIF受信機が取得帯域の中央(DC=オフセット0Hz)に出す、本物ではない細い線を
 #   1取得IQから測る。中央集中(dc_excess 大)は DC スパイクのみで立ち、中央外の

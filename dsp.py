@@ -126,7 +126,19 @@ def measure_signal(iq: np.ndarray, rate: float, center_hz: float) -> dict:
     occupied_frac = float(mask.mean())
     if mask.any():
         active = freqs[mask]
-        bw = float(active.max() - active.min())
+        # 帯域幅は「活性ビンの最外殻の差(max-min)」ではなく、主ピーク(最大パワーの
+        # ビン)を含む連続活性ランの幅とする。max-min だと窓内に離れた2信号がある
+        # とき間の不活性ノイズごと跨いで過大化する（占有僅かでも ~10MHz 等）。ピーク
+        # から両隣へ mask が True の間だけ伸ばし、不活性ビンで止めることで主ピーク側
+        # 1信号の実幅に収める。これは対症療法で、根治(複数信号を各々分離して測る)は
+        # 返り値の形を変える設計判断＝task#6。中心(offset)は従来どおり全活性ビンの重心。
+        peak_i = int(np.argmax(p))            # mask.any() のとき必ず mask[peak_i]=True
+        lo_i = hi_i = peak_i
+        while lo_i - 1 >= 0 and mask[lo_i - 1]:
+            lo_i -= 1
+        while hi_i + 1 < mask.size and mask[hi_i + 1]:
+            hi_i += 1
+        bw = float(freqs[hi_i] - freqs[lo_i])
         w = 10 ** (p[mask] / 10.0)
         offset = float(np.sum(active * w) / np.sum(w))
     else:
