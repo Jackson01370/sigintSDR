@@ -216,3 +216,51 @@ def test_t4_inference_helper(simdata, tmp_path):
     # 形状不正は弾く（迂回しないことの担保）。
     with pytest.raises(ValueError):
         infer.classify_image(ck, np.zeros((128, 128), dtype=np.float32))
+
+
+# ---------------------------------------------------------------------------
+# GPU 対応（device 自動選択 + checkpoint の CPU 化保存）— CPU 後方互換と
+# checkpoint 互換をロックする。cuda 分岐は環境依存なので純関数で検証する。
+# ---------------------------------------------------------------------------
+@requires_torch
+def test_select_device_cpu_when_no_cuda():
+    """CUDA 無し（cuda_available=False）では必ず cpu を返す（後方互換の要）。"""
+    import torch
+    from cnntrain import train
+    assert train._select_device(cuda_available=False) == torch.device("cpu")
+
+
+@requires_torch
+def test_select_device_cuda_when_available():
+    """CUDA 有り（cuda_available=True）では cuda を返す（実 GPU は不要な分岐検証）。"""
+    import torch
+    from cnntrain import train
+    assert train._select_device(cuda_available=True) == torch.device("cuda")
+
+
+@requires_torch
+def test_checkpoint_saved_on_cpu_and_cpu_loadable(simdata, tmp_path):
+    """GPU で学習しても checkpoint は CPU テンソルで保存され、CPU 推論で読める。
+
+    保存側 CPU 化の担保: map_location 無しで読んでも state_dict が全て CPU テンソル
+    （GPU 保存物なら CUDA になり、CPU 機では読めない）。往復で推論まで通す。
+    """
+    import torch
+    from cnntrain import train, infer
+
+    out = tmp_path / "run_cpuckpt"
+    res = train.run_training(simdata, str(out), epochs=1, batch_size=8,
+                             seed=GEN_SEED, val_ratio=0.25, log=lambda s: None)
+
+    # map_location を付けずに読んでも全テンソルが CPU（＝保存時に CPU 化されている）。
+    blob = torch.load(res["ckpt_path"], weights_only=True)
+    assert all(v.device.type == "cpu" for v in blob["state_dict"].values())
+    # 保存形式（キー）不変の確認。
+    assert set(blob.keys()) == {"state_dict", "classes", "in_ch", "meta"}
+
+    # CPU で読み込めて推論できる（--cnn 収集が使う経路の担保）。
+    ck = infer.load_checkpoint(res["ckpt_path"])
+    iq, meta = sigmf_io.read_recording(os.path.join(simdata, "cw-tone_0000"))
+    img = spec.render(iq, float(meta["global"]["core:sample_rate"]))
+    cls, conf = infer.classify_image(ck, img)
+    assert cls in classes.CLASSES and 0.0 <= conf <= 1.0

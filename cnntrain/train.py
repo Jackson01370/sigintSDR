@@ -41,12 +41,30 @@ def _detect_gen_seed(records) -> int | None:
     return None
 
 
-def _epoch_pass(model, loader, criterion, optimizer=None):
-    """1 epoch 分を回す。optimizer 指定時は学習、None なら評価。returns (loss, acc)."""
+def _select_device(cuda_available: bool | None = None) -> "torch.device":
+    """device 自動選択（純関数・テスト可能）: CUDA が使えれば cuda、無ければ cpu。
+
+    cuda_available を明示指定するとその値で分岐する（テスト用）。None なら
+    torch.cuda.is_available() を見る。GPU 前提の決め打ちにしない＝CPU 後方互換。
+    """
+    if cuda_available is None:
+        cuda_available = torch.cuda.is_available()
+    return torch.device("cuda" if cuda_available else "cpu")
+
+
+def _epoch_pass(model, loader, criterion, optimizer=None, device=None):
+    """1 epoch 分を回す。optimizer 指定時は学習、None なら評価。returns (loss, acc).
+
+    device 未指定なら model の載っている device に合わせる（CPU 後方互換）。
+    """
+    if device is None:
+        device = next(model.parameters()).device
     train = optimizer is not None
     model.train(train)
     total, correct, loss_sum = 0, 0, 0.0
     for x, y in loader:
+        x = x.to(device)
+        y = y.to(device)
         if train:
             optimizer.zero_grad()
         logits = model(x)
@@ -74,9 +92,14 @@ def run_training(data_dir: str, out_dir: str, epochs: int = 8,
     os.makedirs(out_dir, exist_ok=True)
     run_name = run_name or os.path.basename(os.path.normpath(out_dir))
 
-    # 再現性（CPU 前提）。
+    # 再現性。
     torch.manual_seed(seed)
     np.random.seed(seed)
+
+    # device 自動選択: CUDA が使えれば GPU、無ければ従来どおり CPU（後方互換）。
+    device = _select_device()
+    if device.type == "cuda":
+        torch.cuda.manual_seed_all(seed)   # GPU 側 RNG（Dropout 等）も同一 seed で固定
 
     train_recs, val_recs, class_names = data.load_split(
         data_dir, val_ratio=val_ratio, seed=seed)
@@ -90,7 +113,7 @@ def run_training(data_dir: str, out_dir: str, epochs: int = 8,
     val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False,
                             num_workers=0)
 
-    model = build_model(n_classes=len(class_names), in_ch=1)
+    model = build_model(n_classes=len(class_names), in_ch=1).to(device)
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
@@ -117,14 +140,18 @@ def run_training(data_dir: str, out_dir: str, epochs: int = 8,
     emit(f"  epochs     : {epochs}   batch: {batch_size}   lr: {lr}")
     emit(f"  seed       : train={seed}  gen={gen_seed}")
     emit(f"  rep_version: {classes.REP_VERSION}   params: {n_params}")
-    emit(f"  device     : cpu   torch: {torch.__version__}")
+    dev_str = ("cpu" if device.type == "cpu"
+               else f"cuda:{torch.cuda.current_device()} "
+                    f"({torch.cuda.get_device_name()})")
+    emit(f"  device     : {dev_str}   torch: {torch.__version__}")
     emit("-" * 72)
 
     history: list[dict] = []
     t0 = time.time()
     for ep in range(1, epochs + 1):
-        tr_loss, tr_acc = _epoch_pass(model, train_loader, criterion, optimizer)
-        va_loss, va_acc = _epoch_pass(model, val_loader, criterion, None)
+        tr_loss, tr_acc = _epoch_pass(model, train_loader, criterion, optimizer,
+                                      device)
+        va_loss, va_acc = _epoch_pass(model, val_loader, criterion, None, device)
         dt = time.time() - t0
         history.append(dict(epoch=ep, train_loss=tr_loss, train_acc=tr_acc,
                             val_loss=va_loss, val_acc=va_acc, elapsed_s=dt))
@@ -135,6 +162,13 @@ def run_training(data_dir: str, out_dir: str, epochs: int = 8,
     train_secs = time.time() - t0
     emit("-" * 72)
     emit(f"  学習完了: {train_secs:.1f}s")
+
+    # checkpoint は CPU 化して保存する。GPU で学習しても、保存物は CPU テンソルの
+    # state_dict とし、CPU 推論（--cnn 収集・既存テスト）でそのまま読めるようにする
+    # （読込側 infer.load_checkpoint は map_location="cpu" で二重に安全）。保存する
+    # dict のキー・メタは一切変えない。以降の評価もこの CPU モデル＋CPU val_loader
+    # で走るため evaluate 経路は無改修（device 最適化は将来課題）。
+    model.to("cpu")
 
     # --- チェックポイント保存 ---
     meta = dict(
