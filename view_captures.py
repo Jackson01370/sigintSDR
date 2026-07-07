@@ -39,12 +39,18 @@ def _meta_summary(meta: dict) -> dict:
     g = meta.get("global", {}) or {}
     anns = meta.get("annotations", []) or []
     a = anns[0] if anns else {}
-    center = float(g.get("core:frequency", a.get("core:freq_lower_edge", 0.0)) or 0.0)
-    # center は global に無い場合があるので annotation の上下端から復元
+    # center は IQ の物理中心。SigMF 標準では core:frequency は captures 要素に入る
+    #   （sigmf_io.write_recording もそう書く）ため、まず captures[0] を見る。global 直下は
+    #   旧データ互換のフォールバック、annotation 上下端からの復元は最後の手段。
+    caps = meta.get("captures", []) or []
+    c0 = caps[0] if caps else {}
     lo = a.get("core:freq_lower_edge")
     hi = a.get("core:freq_upper_edge")
+    center = float(c0.get("core:frequency", 0.0) or 0.0)      # 第一: IQ の物理中心（正）
+    if not center:
+        center = float(g.get("core:frequency", 0.0) or 0.0)   # 第二: 旧データ互換（global保持）
     if (not center) and lo is not None and hi is not None:
-        center = (float(lo) + float(hi)) / 2.0
+        center = (float(lo) + float(hi)) / 2.0                # 第三: annotationから復元（最後の手段）
     return {
         "rate": float(g.get("core:sample_rate", spec.CAPTURE_RATE_HZ) or spec.CAPTURE_RATE_HZ),
         "hw": str(g.get("core:hw", "?")),
@@ -57,6 +63,9 @@ def _meta_summary(meta: dict) -> dict:
         "persistence": a.get("sigscan:persistence"),
         "spur": a.get("sigscan:spur_suspect"),
         "bw_hz": (float(hi) - float(lo)) if (lo is not None and hi is not None) else None,
+        # 検出帯（annotation の下端/上端, Hz）。マーカー描画用。無ければ None。
+        "det_lo": (float(lo) if lo is not None else None),
+        "det_hi": (float(hi) if hi is not None else None),
         # CNN 監査来歴（M3 以降の記録のみ global に載る。古い記録は None）
         "cnn_verdict": g.get("sigscan:cnn_verdict"),
         "cnn_class": g.get("sigscan:cnn_class"),
@@ -142,9 +151,24 @@ def render_one(base: str, out_path: str, flatten_dc: bool = False) -> dict:
     axL.imshow(img, aspect="auto", origin="lower", cmap="viridis", extent=extent)
     axL.set_xlabel("time (normalized)")
     axL.set_ylabel("frequency (MHz)")
+    # 保存の根拠になった検出帯[det_lo, det_hi]を半透明の横帯＋上下端の細線で重畳（軸=周波数）。
+    #   「検出帯」と「画像の実体」のズレが一目で見える（dwell の混獲記録の発見用）。
+    #   spec.render の画像ピクセルには一切触れない（目盛りと注記の重畳のみ）。
+    det_lo = info.get("det_lo")
+    det_hi = info.get("det_hi")
+    if det_lo is not None and det_hi is not None:
+        axL.axhspan(det_lo / 1e6, det_hi / 1e6, alpha=0.15, color="#ff7f0e")
+        axL.axhline(det_lo / 1e6, color="#ff7f0e", lw=0.6, alpha=0.7)
+        axL.axhline(det_hi / 1e6, color="#ff7f0e", lw=0.6, alpha=0.7)
     cen = info["center"] / 1e6
     bw = (info["bw_hz"] / 1e6) if info["bw_hz"] else None
-    title = f"{cen:.1f} MHz"
+    # タイトルは二本立て: IQ 中心(tuner)と検出中心(det=(lo+hi)/2)を併記。det の無い記録は
+    #   従来様式（tuner のみ＋BW）。
+    if det_lo is not None and det_hi is not None:
+        det_cen = (det_lo + det_hi) / 2.0 / 1e6
+        title = f"tuner {cen:.1f} MHz | det {det_cen:.1f} MHz"
+    else:
+        title = f"{cen:.1f} MHz"
     if bw:
         title += f"  BW~{bw:.1f} MHz"
     if info["label"] or info.get("cnn_verdict"):
