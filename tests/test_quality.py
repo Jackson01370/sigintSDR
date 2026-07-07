@@ -62,6 +62,58 @@ def test_narrow_bursty_signal_kept():
     assert v.reasons == []
 
 
+def test_narrow_steady_but_intermittent_not_spur():
+    """細い＋振幅一定(snr_std 小=steady)でも、間欠(persist<spur_persistence_min)なら
+    narrow-steady-spur に該当しない。定常性の persist 条件が「振幅の一定さ」とは独立に
+    間欠信号を救うことを、snr_std を steady 側に固定して単独で検証する。
+
+    （test_narrow_bursty_signal_kept は snr_std を大きくして steady を外すため、
+    persist 条件そのものは検証できていない。ここは persist 条件だけを分離する。）
+    persist=0.5 は low-persistence 閾(0.34)より上なので、narrow-steady-spur の
+    persist 分岐だけが効き、他の drop が混ざらない。
+    """
+    obs = _obs(bw_rep_hz=0.3e6, snr_std_db=0.2, persistence=0.5, n_detect=10)
+    v = quality.evaluate_quality(obs, QualityConfig())
+    assert not v.is_spur_suspect               # persist<0.9 → 居座りスプリアスではない
+    assert "narrow-steady-spur" not in v.reasons
+    assert v.passed                             # 他の drop も無く合格
+
+
+def test_narrow_intermittent_ble_not_flagged_spur():
+    """実機の間欠 BLE 相当(persist≈0.26=5/19・狭帯域バースト)は
+    narrow-steady-spur に該当しない（BLE 救済）。
+
+    この観測は low-persistence では落ちるが、それは別ゲートの管轄（別タスク）。
+    narrow-steady-spur が間欠 BLE を巻き込まないことのみをここで固定する。
+    """
+    obs = _obs(bw_rep_hz=0.3e6, snr_std_db=0.2, persistence=0.26,
+               n_detect=5, n_obs=19)
+    v = quality.evaluate_quality(obs, QualityConfig())
+    assert not v.is_spur_suspect               # narrow-steady-spur には該当しない
+    assert "narrow-steady-spur" not in v.reasons
+    # low-persistence（別ゲート）では落ちる＝narrow-steady-spur の管轄外を明示
+    assert any("low-persistence" in r for r in v.reasons)
+
+
+def test_narrow_steady_spur_persistence_boundary():
+    """narrow＋steady を固定し persist が spur_persistence_min(0.9) 境界を跨ぐと
+    narrow-steady-spur 判定が切り替わる（persist 条件が本判定を支配することを固定）。
+
+    定常スプリアス(persist≈1.0)は従来どおり弾き、間欠側(閾未満)は弾かない。
+    persist 条件を削ると閾未満でも spur になり、このテストが失敗する＝退行検知。
+    """
+    thr = QualityConfig().spur_persistence_min          # 0.9
+    below = quality.evaluate_quality(
+        _obs(bw_rep_hz=0.3e6, snr_std_db=0.2, persistence=thr - 0.01),
+        QualityConfig())
+    at = quality.evaluate_quality(
+        _obs(bw_rep_hz=0.3e6, snr_std_db=0.2, persistence=thr),
+        QualityConfig())
+    assert not below.is_spur_suspect                    # 閾未満 → 救済
+    assert at.is_spur_suspect                            # 閾以上 → 従来どおり弾く（除去維持）
+    assert "narrow-steady-spur" in at.reasons
+
+
 def test_bw_override_controls_narrow_decision():
     """bw_hz オーバーライドが「極細」判定を支配する（サーベイ実測bwを使える）。"""
     qcfg = QualityConfig()
