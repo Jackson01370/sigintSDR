@@ -21,6 +21,24 @@ import dwell
 import quality
 
 
+def dwell_tune_offset(bw_hz, offset_hz: float, max_bw_hz: float) -> float:
+    """dwell 収集で実際に適用するチューナーオフセット(Hz)を返す（オフセットチューニング）。
+
+    狭帯域ターゲット(bw_hz <= max_bw_hz)のときだけ offset_hz を返し、それ以外
+    ——広帯域(bw>max_bw で信号端が窓外に出る)・bw 不明(None)・offset_hz=0(既定)——は
+    0.0 を返す（適用判断は「不明なら適用しない」側へ倒す）。呼び出し側は
+    f_tune = target_center + dwell_tune_offset(...) を capture_iq / measure_signal /
+    記録 center に一貫して渡すこと（絶対周波数の一貫性が本機能の技術的核心）。
+
+    狙った獲物を取得帯域の中央(DC=0Hz)から離し、DC残留線や DC位置の固定スパイク
+    (クロック高調波等)との重なりで dc-spike ゲートに構造的に落ちるのを防ぐ。適用判断を
+    dwell 収集の全経路で共有する唯一の関門（経路間の不一致を作らない）。
+    """
+    if offset_hz and bw_hz is not None and float(bw_hz) <= float(max_bw_hz):
+        return float(offset_hz)
+    return 0.0
+
+
 class HybridScheduler:
     def __init__(self, backend: SDRBackend, cfg: Config, store: Store | None = None,
                  collect_dir: str | None = None, collect_snr_min: float = 8.0,
@@ -173,7 +191,13 @@ class HybridScheduler:
     # --- ドウェル ---
     def dwell(self, target: dict) -> tuple[dict, classify.ClassResult]:
         c = self.cfg
-        center_hz = target["center"]
+        # オフセットチューニング: 狭帯域ターゲットはチューナーを数MHzずらし、獲物を取得帯域
+        #   中央(DC)から外す。既定 dwell_offset_hz=0 で off=0 ＝ center_hz=target["center"]
+        #   （従来挙動）。f_tune(=center_hz) を capture_iq / measure_signal / 記録 center に
+        #   一貫して渡す（絶対周波数の一貫性）。target["center"]（狙い値）自体は書き換えない。
+        off = dwell_tune_offset(target.get("bw"), c.sdr.dwell_offset_hz,
+                                c.sdr.dwell_offset_max_bw_hz)
+        center_hz = float(target["center"]) + off
         iq = self.be.capture_iq(center_hz, c.sdr.dwell_rate_hz, c.sdr.dwell_samples)
         m = dsp.measure_signal(iq, c.sdr.dwell_rate_hz, center_hz)
 
@@ -210,6 +234,7 @@ class HybridScheduler:
                     extra_global={"sigscan:rep_version": spec.SIGSCAN_REP_VERSION,
                                   "sigscan:target_src": target.get("src", ""),
                                   "sigscan:dc_removed": self._dc_removed,
+                                  "sigscan:dwell_offset_hz": off,
                                   **self._focus_global()},
                 )
                 self._collected += 1
@@ -230,10 +255,15 @@ class HybridScheduler:
         name = (f"{int(round(obs.center_hz/1e6))}MHz_"
                 f"{int(time.time()*1000)}_{self._collected}")
         base = os.path.join(self.collect_dir, name)
+        # 適用したオフセットを来歴として記録（dwell_observe_cycle と同じ helper・同じ入力で
+        #   再計算＝決定論的に一致。0.0 は不適用）。旧記録との区別はキーの有無で可能。
+        off = dwell_tune_offset(target.get("bw"), self.cfg.sdr.dwell_offset_hz,
+                                self.cfg.sdr.dwell_offset_max_bw_hz)
         extra_global = {"sigscan:rep_version": spec.SIGSCAN_REP_VERSION,
                         "sigscan:target_src": target.get("src", ""),
                         "sigscan:capture_mode": "dwell",
                         "sigscan:dc_removed": self._dc_removed,
+                        "sigscan:dwell_offset_hz": off,
                         **self._focus_global()}
         if cnn_prov:
             # 凍結 write_recording は extra_global を global にそのまま展開する
@@ -264,8 +294,14 @@ class HybridScheduler:
         targets = self._build_targets()
         observed: list[tuple[dict, "dwell.DwellObservation"]] = []
         for t in targets:
+            # オフセットチューニング（狭帯域のみ・既定 off=0=従来挙動）。f_tune を
+            #   observe_dwell に渡すと capture_iq / measure_signal / DwellObservation.center_hz
+            #   まで一貫して f_tune を使う（観測ループ側は無改変で絶対周波数の一貫性を得る）。
+            #   適用判断は dwell() と同じ helper＝経路間で不一致を作らない。
+            f_tune = float(t["center"]) + dwell_tune_offset(
+                t.get("bw"), c.sdr.dwell_offset_hz, c.sdr.dwell_offset_max_bw_hz)
             obs = dwell.observe_dwell(
-                self.be, t["center"], c.sdr.dwell_rate_hz, c.sdr.dwell_samples,
+                self.be, f_tune, c.sdr.dwell_rate_hz, c.sdr.dwell_samples,
                 c.dwell, c.quality, target_src=t.get("src", ""))
             observed.append((t, obs))
 

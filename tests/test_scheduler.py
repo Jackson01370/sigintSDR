@@ -262,3 +262,109 @@ def test_focus_records_band_focus_in_sigmf_global(tmp_path):
     # 来歴は範囲つき dict で記録（bool ではなく {"start","stop"}）
     assert meta["global"]["sigscan:band_focus"] == {"start": _FOCUS_LO,
                                                      "stop": _FOCUS_HI}
+
+
+# ===========================================================================
+# dwell オフセットチューニング（狙った獲物を DC 位置から避ける）
+#   狭帯域ターゲットはチューナーを数MHzずらし、獲物が DC(=0Hz)に乗って dc-spike で
+#   構造的に落ちるのを防ぐ。既定 dwell_offset_hz=0 で完全に従来挙動。追加のみ。
+# ===========================================================================
+def test_dwell_tune_offset_application_conditions():
+    """適用条件のユニット: f_tune = center + dwell_tune_offset(...)。
+
+    (a) offset=0 → 0（従来）。(b) 狭帯域(bw<=max) → offset 適用。
+    (c) 広帯域(bw>max) → 0（信号端が窓外に出るため不適用）。(d) bw 不明 → 0。
+    """
+    from scheduler import dwell_tune_offset
+    center = 2.402e9
+    assert dwell_tune_offset(1.5e6, 0.0, 8e6) == 0.0            # (a)
+    assert dwell_tune_offset(1.5e6, 4e6, 8e6) == 4e6           # (b)
+    assert center + dwell_tune_offset(1.5e6, 4e6, 8e6) == center + 4e6
+    assert dwell_tune_offset(16e6, 4e6, 8e6) == 0.0            # (c) 広帯域は不適用
+    assert dwell_tune_offset(None, 4e6, 8e6) == 0.0           # (d) bw 不明は不適用
+    assert dwell_tune_offset(8e6, 4e6, 8e6) == 4e6            # 境界 bw==max は適用(<=)
+
+
+def _offset_sched(tmp_path, offset_hz, F=2.402e9):
+    """狭帯域CW(定常)を F に置き、F を狙う detected ターゲット1件を注入した dwell 収集。
+
+    bw=1e6 は narrow_bw(0.7e6) より広いので narrow-steady-spur は不適用＝dc-spike の
+    効きだけを裸で観測できる。offset_hz を cfg.sdr.dwell_offset_hz に設定。
+    """
+    from sdr import _SimSignal
+    sdr = SDRConfig(dwell_samples=1 << 14, dwell_offset_hz=offset_hz)
+    scan = ScanConfig(start_hz=2.4e9, stop_hz=2.5e9, max_dwell_per_cycle=1)
+    dwl = DwellConfig(dwell_seconds=0.0, obs_interval_s=0.0,
+                      min_observations=12, max_observations=12)
+    cfg = Config(sdr=sdr, scan=scan, dwell=dwl, quality=QualityConfig())
+    be = SimBackend(cfg.sdr, seed=0)
+    be.signals = [_SimSignal(F, 0.1e6, 30, prob=1.0, kind="cw")]   # 定常・狭帯域CW
+    collect = str(tmp_path / "captures")
+    sched = HybridScheduler(be, cfg, collect_dir=collect, collect_snr_min=0.0,
+                            collect_dedup_s=0.0, dwell_mode=True)
+    # detected ターゲット注入: bw=1e6(>narrow_bw) で narrow-steady-spur を外す。
+    sched._segments = [dict(f_center=F, bw_hz=1.0e6, snr_db=30.0,
+                            f_lo=F - 0.5e6, f_hi=F + 0.5e6, peak_db=-40.0)]
+    return sched, collect, F
+
+
+def test_dwell_offset_zero_drops_dc_spike_prey_sim(tmp_path):
+    """offset=0: 狭帯域CWが DC に乗り dc-spike のみで drop（narrow-steady-spur ではない）。
+
+    再現の核心: bw=1e6 で narrow-steady-spur は不適用、CW が DC(0Hz)に定数として乗るため
+    dc_excess が大かつ時間不変 → dc-spike 判定（quality.py: dc_excess_mean>=12 かつ
+    dc_excess_std<=3）で構造的に落ちる。
+    """
+    sched, collect, F = _offset_sched(tmp_path, offset_hz=0.0)
+    outcomes = sched.dwell_observe_cycle()
+    o = outcomes[0]
+    assert not o["verdict"].passed
+    assert o["verdict"].is_dc_spike
+    assert "dc-spike" in o["verdict"].reasons
+    assert "narrow-steady-spur" not in o["verdict"].reasons   # bw=1e6 で不適用
+    assert not o["saved"]
+    assert not glob.glob(os.path.join(collect, "*.sigmf-data"))
+
+
+def test_dwell_offset_saves_prey_with_correct_abs_freq_sim(tmp_path):
+    """offset=4e6: 同じ獲物が保存され、annotation の絶対周波数が真の F と一致（±分解能）。
+
+    ここが崩れると全記録の周波数が静かに壊れるため最重要（絶対周波数の一貫性）。
+    チューナーは F+4e6 に合うが、記録される検出中心は Sim 信号の真の周波数 F。
+    """
+    sched, collect, F = _offset_sched(tmp_path, offset_hz=4e6)
+    outcomes = sched.dwell_observe_cycle()
+    o = outcomes[0]
+    assert o["verdict"].passed and not o["verdict"].is_dc_spike
+    assert o["saved"]
+    data = sorted(glob.glob(os.path.join(collect, "*.sigmf-data")))
+    assert len(data) == 1
+    base = data[0][: -len(".sigmf-data")]
+    _, meta = sigmf_io.read_recording(base)
+    # SigMF captures[0].core:frequency = f_tune（物理IQ中心 = F+4e6）
+    assert abs(meta["captures"][0]["core:frequency"] - (F + 4e6)) < 1e3
+    # annotation の絶対周波数(検出中心) = Sim 信号の真の周波数 F（±測定分解能）
+    ann = meta["annotations"][0]
+    det_center = (ann["core:freq_lower_edge"] + ann["core:freq_upper_edge"]) / 2.0
+    assert abs(det_center - F) < 0.2e6
+    # 来歴: 適用した実効オフセットが global に記録される
+    assert meta["global"]["sigscan:dwell_offset_hz"] == 4e6
+
+
+def test_dwell_offset_default_zero_is_unchanged_behavior_sim(tmp_path):
+    """既定(dwell_offset_hz=0): f_tune=center で記録の来歴 offset=0.0（従来挙動の回帰）。
+
+    既定では DC に乗った狭帯域CWは従来どおり dc-spike で落ちる（保存されない）ため、
+    ここでは「offset を適用しない同一経路で来歴 0.0」を、救済されるオフセット版との
+    対比としてゲート無効化で1件保存し確認する。
+    """
+    sched, collect, F = _offset_sched(tmp_path, offset_hz=0.0)
+    sched.cfg.quality.enabled = False           # ゲート無効化で確実に1件保存し来歴を検証
+    sched.dwell_observe_cycle()
+    data = sorted(glob.glob(os.path.join(collect, "*.sigmf-data")))
+    assert len(data) == 1
+    base = data[0][: -len(".sigmf-data")]
+    _, meta = sigmf_io.read_recording(base)
+    assert meta["global"]["sigscan:dwell_offset_hz"] == 0.0     # 不適用
+    # f_tune=center: 物理IQ中心は狙い F のまま（オフセットされていない）
+    assert abs(meta["captures"][0]["core:frequency"] - F) < 1e3

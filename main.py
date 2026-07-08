@@ -77,6 +77,10 @@ def main():
                    help="各対象帯に滞在する秒数(既定10)。指定すると滞在観測モードを有効化")
     p.add_argument("--obs-interval", type=float, default=None, metavar="SEC",
                    help="滞在中の観測間隔 秒(既定0.5)")
+    p.add_argument("--dwell-offset-hz", type=float, default=None, metavar="HZ",
+                   help="dwell収集時にチューナー中心へ加算するオフセットHz（狭帯域の獲物を"
+                        "取得帯域の中央=DC位置から避け、dc-spike の構造落ちを防ぐ）。"
+                        "既定0=無効（従来挙動）。サーベイには適用しない")
     # --- 品質ゲートのしきい値オーバーライド（既定は config の厳しめ値）---
     p.add_argument("--q-detect-snr", type=float, default=None, metavar="DB",
                    help="1観測で検出とみなすSNR下限dB")
@@ -147,6 +151,8 @@ def main():
         cfg.dwell.dwell_seconds = args.dwell_seconds
     if args.obs_interval is not None:
         cfg.dwell.obs_interval_s = args.obs_interval
+    if args.dwell_offset_hz is not None:
+        cfg.sdr.dwell_offset_hz = args.dwell_offset_hz
     # 品質ゲートのしきい値オーバーライド
     if args.q_detect_snr is not None:
         cfg.quality.detect_snr_db = args.q_detect_snr
