@@ -45,6 +45,21 @@ class SDRConfig:
     dwell_offset_max_bw_hz: float = 8e6
 
 
+def dwell_samples_for_ms(capture_ms: float, rate_hz: float) -> int:
+    """1回のドウェル取得(スナップショット)の長さ ms を IQ サンプル数に変換する。
+
+    n = round(capture_ms/1000 * rate_hz)。rate は SDRConfig.dwell_rate_hz(既定 20MSPS)。
+    例) 13.107ms→262144(既定 2^18) / 300ms→6,000,000 / 400ms→8,000,000(≈64MB, complex64)。
+
+    duty 審判(cnntrain.dutyprobe)が BLE adv 間隔(20-100ms)の隙間を分解するには
+    snapshot>=300ms が要る。既定の 13ms では全件 inconclusive になる（在時率が結論不能）。
+    capture_ms<=0 は不正(ValueError)。返り値は 1 以上を保証する。
+    """
+    if not (capture_ms > 0):
+        raise ValueError(f"capture_ms は正の値である必要があります: {capture_ms!r}")
+    return max(int(round(capture_ms / 1000.0 * rate_hz)), 1)
+
+
 # ---------------------------------------------------------------------------
 # スキャン制御パラメータ
 # ---------------------------------------------------------------------------

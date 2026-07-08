@@ -11,7 +11,7 @@ from __future__ import annotations
 import argparse
 import sys
 
-from config import Config
+from config import Config, dwell_samples_for_ms
 from store import Store
 from scheduler import HybridScheduler
 
@@ -77,6 +77,11 @@ def main():
                    help="各対象帯に滞在する秒数(既定10)。指定すると滞在観測モードを有効化")
     p.add_argument("--obs-interval", type=float, default=None, metavar="SEC",
                    help="滞在中の観測間隔 秒(既定0.5)")
+    p.add_argument("--capture-ms", type=float, default=None, metavar="MS",
+                   dest="capture_ms",
+                   help="1回のドウェル取得(スナップショット)の長さms(既定 約13ms=2^18@20MSPS)。"
+                        "duty審判が adv間隔(20-100ms)の隙間を分解するには300-500ms推奨"
+                        "(既定13msだと全件inconclusive)。長尺ほどIQファイル増(400ms≒64MB/件)")
     p.add_argument("--dwell-offset-hz", type=float, default=None, metavar="HZ",
                    help="dwell収集時にチューナー中心へ加算するオフセットHz（狭帯域の獲物を"
                         "取得帯域の中央=DC位置から避け、dc-spike の構造落ちを防ぐ）。"
@@ -153,6 +158,11 @@ def main():
         cfg.dwell.obs_interval_s = args.obs_interval
     if args.dwell_offset_hz is not None:
         cfg.sdr.dwell_offset_hz = args.dwell_offset_hz
+    # 取得スナップショット長の上書き（既定 2^18≒13ms）。scheduler は両取得経路とも
+    # cfg.sdr.dwell_samples を読むので、ここで差し替えれば dwell.py/scheduler.py は不変。
+    if args.capture_ms is not None:
+        cfg.sdr.dwell_samples = dwell_samples_for_ms(
+            args.capture_ms, cfg.sdr.dwell_rate_hz)
     # 品質ゲートのしきい値オーバーライド
     if args.q_detect_snr is not None:
         cfg.quality.detect_snr_db = args.q_detect_snr
@@ -194,6 +204,14 @@ def main():
         gate = "無効" if not cfg.quality.enabled else "厳しめ"
         print(f"滞在観測モード: 各対象に {cfg.dwell.dwell_seconds:g}s 滞在 / "
               f"観測間隔 {cfg.dwell.obs_interval_s:g}s / 品質ゲート={gate}")
+    if args.capture_ms is not None:
+        _ms = cfg.sdr.dwell_samples / cfg.sdr.dwell_rate_hz * 1000.0
+        _mb = cfg.sdr.dwell_samples * 8 / 1e6
+        print(f"取得長(スナップショット): {_ms:.1f}ms = {cfg.sdr.dwell_samples} サンプル "
+              f"(≈{_mb:.0f}MB/件, complex64)")
+        if _mb > 128:
+            print(f"  注意: 長尺取得。dwell は滞在中の各観測の生IQを保持するため、"
+                  f"ピークメモリ≈{_mb:.0f}MB×観測回数。長尺時は --dwell-seconds を短めに")
     if args.collect:
         print(f"収集モード: SigMF を {args.collect}/ に保存 (SNR>={args.collect_snr}dB)")
     if cfg.cnn.enabled:
