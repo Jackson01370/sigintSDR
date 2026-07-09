@@ -56,14 +56,19 @@ def candidate_labels() -> list[str]:
     return uniq
 
 
-def find_low_confidence(dirpath: str, conf_max: float = 0.5) -> list[dict]:
+def find_low_confidence(dirpath: str, conf_max: float = 0.5,
+                        pattern: str | None = None) -> list[dict]:
     """method=='rule' かつ confidence<conf_max のアノテーションを列挙。
+
+    pattern 指定時はファイル名(ベース)が pattern に一致する *.sigmf-meta だけを走査
+    する（既定 None＝全 *.sigmf-meta で従来どおり）。conf_max による絞りは不変。
 
     returns: [{meta_path, ann_index, meta, ann, center, bw, label, confidence,
                snr_db, hw, datetime}, ...]
     """
     items: list[dict] = []
-    for meta_path in sorted(glob.glob(os.path.join(dirpath, "*.sigmf-meta"))):
+    glob_pat = (pattern + ".sigmf-meta") if pattern else "*.sigmf-meta"
+    for meta_path in sorted(glob.glob(os.path.join(dirpath, glob_pat))):
         try:
             # sigmf_io と同じ（ロケール既定）エンコーディングで開き往復互換を保つ。
             with open(meta_path) as f:
@@ -118,18 +123,20 @@ def _candidate_hint(comment) -> str | None:
     return comment[idx:].strip()
 
 
-def find_c_conflict(dirpath: str) -> list[dict]:
+def find_c_conflict(dirpath: str, pattern: str | None = None) -> list[dict]:
     """global の sigscan:cnn_verdict=='C-conflict' の記録のアノテーションを列挙。
 
     読み取りのみ（captures/ は書き換えない）。sigmf_io と同じロケール既定
     エンコーディングで meta を開く（UTF-8 決め打ちしない）。global にキーが
-    無い古い記録は安全に除外する。
+    無い古い記録は安全に除外する。pattern 指定時はファイル名(ベース)一致の
+    *.sigmf-meta だけを走査（既定 None＝従来どおり）。
 
     returns: find_low_confidence と互換の item に CNN 来歴（cnn_class/cnn_conf/
              cnn_verdict）・comment・method（='cnn'）を足した dict のリスト。
     """
     items: list[dict] = []
-    for meta_path in sorted(glob.glob(os.path.join(dirpath, "*.sigmf-meta"))):
+    glob_pat = (pattern + ".sigmf-meta") if pattern else "*.sigmf-meta"
+    for meta_path in sorted(glob.glob(os.path.join(dirpath, glob_pat))):
         try:
             # find_low_confidence と同じ（ロケール既定）エンコーディングで開く。
             with open(meta_path) as f:
@@ -245,7 +252,8 @@ def _print_item(item: dict, print_fn) -> None:
 
 
 def run_review(dirpath: str, conf_max: float = 0.5,
-               input_fn=input, print_fn=print, verdict: str | None = None) -> int:
+               input_fn=input, print_fn=print, verdict: str | None = None,
+               pattern: str | None = None) -> int:
     """対話で低信頼アノテーションを再ラベルする。
 
     input_fn / print_fn は差し替え可能（テスト用）。input_fn が空文字や 's' を
@@ -253,14 +261,18 @@ def run_review(dirpath: str, conf_max: float = 0.5,
 
     verdict=='C' 指定時は対象を rule 低信頼ではなく CNN 監査 (C)=C-conflict の
     記録に切り替える（選別のみ変更。確定＝apply_label のロジックは不変）。
+    pattern 指定時はファイル名(ベース)一致のレコードだけに絞る（選別のみ・確定不変）。
     """
     if verdict == "C":
-        items = find_c_conflict(dirpath)
+        items = find_c_conflict(dirpath, pattern=pattern)
         header = (f"CNN監査(C)レビュー: sigscan:cnn_verdict=='{C_CONFLICT}' の記録 "
                   f"{len(items)} 件（対象ディレクトリ: {dirpath}）")
     else:
-        items = find_low_confidence(dirpath, conf_max=conf_max)
-        header = (f"低信頼レビュー: method='rule' かつ confidence<{conf_max} の"
+        items = find_low_confidence(dirpath, conf_max=conf_max, pattern=pattern)
+        _scope = (f"confidence<{conf_max}" if conf_max != float("inf") else "全信頼度")
+        if pattern:
+            _scope += f" / pattern='{pattern}'"
+        header = (f"低信頼レビュー: method='rule' かつ {_scope} の"
                   f"アノテーション {len(items)} 件（対象ディレクトリ: {dirpath}）")
     cands = candidate_labels()
 
@@ -304,13 +316,17 @@ def run_review(dirpath: str, conf_max: float = 0.5,
     return 0
 
 
-def _cmd_list(dirpath: str, conf_max: float, verdict: str | None = None) -> int:
+def _cmd_list(dirpath: str, conf_max: float, verdict: str | None = None,
+              pattern: str | None = None) -> int:
     if verdict == "C":
-        items = find_c_conflict(dirpath)
+        items = find_c_conflict(dirpath, pattern=pattern)
         print(f"CNN監査(C)記録 {len(items)} 件 (sigscan:cnn_verdict=='{C_CONFLICT}'):")
     else:
-        items = find_low_confidence(dirpath, conf_max=conf_max)
-        print(f"低信頼アノテーション {len(items)} 件 (method='rule', confidence<{conf_max}):")
+        items = find_low_confidence(dirpath, conf_max=conf_max, pattern=pattern)
+        _scope = (f"confidence<{conf_max}" if conf_max != float("inf") else "全信頼度")
+        if pattern:
+            _scope += f", pattern='{pattern}'"
+        print(f"低信頼アノテーション {len(items)} 件 (method='rule', {_scope}):")
     for item in items:
         base = os.path.basename(item['meta_path'])
         head = (f"  {item['center']/1e6:9.3f}MHz  conf={item['confidence']:.2f}  "
@@ -337,17 +353,32 @@ def main(argv=None) -> int:
     p = argparse.ArgumentParser(prog="review",
                                 description="低信頼アノテーションの人手レビュー/再ラベル")
     p.add_argument("dir", help="SigMF を格納したディレクトリ")
-    p.add_argument("--conf-max", type=float, default=0.5, dest="conf_max",
-                   help="この信頼度未満の rule アノテーションを対象（既定0.5）")
+    p.add_argument("--conf-max", type=float, default=None, dest="conf_max",
+                   help="この信頼度未満の rule アノテーションを対象（既定0.5）。"
+                        "--pattern 単独時は信頼度を無視、併用時は AND")
     p.add_argument("--list", action="store_true",
                    help="対象を列挙するだけで書き換えない")
     p.add_argument("--verdict", choices=["C"], default=None,
                    help="CNN監査で (C)=C-conflict になった記録を対象にする"
                         "（rule低信頼の代わり。未指定なら従来どおり）")
+    p.add_argument("--pattern", default=None, metavar="GLOB",
+                   help="ファイル名(ベース)が GLOB に一致するレコードだけを対象にする"
+                        "（例 \"2402MHz_1783530*\"）。特定レコードを狙い撃つ選別フィルタ。"
+                        "--conf-max と併用で AND、単独なら信頼度に関わらず一致ファイルを対象")
     args = p.parse_args(argv)
+    # --conf-max 実効値: 明示指定を最優先。--pattern 単独なら信頼度を無視(inf)。
+    #   どちらも無ければ従来既定 0.5（＝既存の対象選択・挙動は不変）。
+    if args.conf_max is not None:
+        conf_max = args.conf_max
+    elif args.pattern is not None:
+        conf_max = float("inf")
+    else:
+        conf_max = 0.5
     if args.list:
-        return _cmd_list(args.dir, args.conf_max, verdict=args.verdict)
-    return run_review(args.dir, conf_max=args.conf_max, verdict=args.verdict)
+        return _cmd_list(args.dir, conf_max, verdict=args.verdict,
+                         pattern=args.pattern)
+    return run_review(args.dir, conf_max=conf_max, verdict=args.verdict,
+                      pattern=args.pattern)
 
 
 if __name__ == "__main__":
