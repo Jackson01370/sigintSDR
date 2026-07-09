@@ -10,8 +10,8 @@
 ## このログのスコープ
 
 BLE advertising の ground truth を 2.4GHz ISM で積む取り組みの記録。
-- **主目標**: BLE adv を各チャネルで human確定して ground truth を貯める。ch38(2426) は達成済み（3件、method=human）。ch37(2402)・ch39(2480) が次。
-- **副次目標**: dc-spike説の白黒 —「DC上に乗った間欠BLEが dc-spike ゲートで落ちるか」。過去に「必ず落ちる」と結論しオフセット実装の動機にしたが、要再検証に格下げ済み。
+- **主目標**: BLE adv を各チャネルで human確定して ground truth を貯める。**ch38(2426)・ch37(2402) 達成済み（各3件、method=human。計6件）**。ch39(2480) が次。
+- **副次目標**: dc-spike説の白黒 —「DC上に乗った間欠BLEが dc-spike ゲートで落ちるか」。過去に「必ず落ちる」と結論しオフセット実装の動機にしたが、要再検証に格下げ済み。**→ Entry①②で「白」寄りが補強：オンDCの間欠BLEはdc-spikeで落ちない（落ちるのは別ゲート narrow-steady-spur、しかも13msでは落ちない）**。
 
 ### プロジェクト背景（1分版）
 HackRF One で 2.4GHz をスキャン→信号自動識別。3段（ルール分類器→CNN監査→LLM vision）、SigMF保存。設計思想は「**AIが提案・人間が承認**」。ルールやCNNやAIの出力を**CNNの学習ラベルにしない**（ラベル汚染防止）。ground truth は人間が `review.py` で視覚確認して確定したときだけ成立。凍結契約が spec.py / sigmf_io.py / main.py / observation/ を守る。
@@ -124,13 +124,65 @@ Entry② の前提ブロッカー「capture長のCLIノブ」を CC が解決。
   ≈64MB/件。--dwell-seconds 10 / obs-interval 0.5 だと ~20観測 → ピーク ~1.3GB。上のコマンドは
   dwell-seconds 4(~8観測 ≈0.5GB)に抑えた。main.py も 128MB/件超で警告を出す。
 
-### 結果（実行後にKaliが記入）
-- （観測をここに追記: 実際の det 周波数 / duty / ゲート挙動 / BLE ch37 と確認できたか / human確定に進めたか）
+### 結果（2026-07-08 夜〜07-09・2手のランで実行）
+
+計画（2402ターゲット・400ms長尺）を実行。2手に分かれた。
+
+**ラン1（イヤホン電源ON・交絡発覚）**
+2402近傍が幅4–10MHzの信号に支配され、ルールは大半を "Zigbee/独自2.4G" と誤ラベル、時々SNR38–52dBの強候補が湧いた。当初これを「WiFi級広帯域が支配」と読んだが**誤読**。スペクトログラム目視で正体判明＝**Bluetoothイヤホン（BT Classic/A2DP）の周波数ホッピング(FHSS)**。「幅7–10MHz」は400ms窓がホップ先を1検出に塗り広げた**測定アーティファクト**で、実体は離散バーストの集合。教訓7（イヤホン混獲）の再演。環境管理リストからイヤホンが漏れていた。→ このデータはground truth不可。
+
+**ラン2（イヤホン電源OFF・BLE ch37確認）**
+交絡を消すと局面が一変。検出帯に**離散1.1–1.2MHz幅のバースト**（spur_suspect=False・2400線と分離）＝正真正銘のBLE ch37 adv が出た。tuner≈det≈2402（オンDC）。狙い通り2402にch37 advが実在することを確認。別に1件、上下端まで貫く20MHz級のWiFiフレームも混入（ルールはZigbee誤ラベル＝400ms切取アーティファクト）。
+
+**設計衝突を実証（400ms × narrow-steady-spur）**
+ラン2のログはほぼ全行が `BLE(adv?) BW=1.0–1.2MHz [drop:narrow-steady-spur]`＝**400msではnarrow-steady-spurがBLEを落とす**（収集4件のみ）。イヤホンOFFで交絡が消えて初めて、これが環境でなくゲート×窓長の衝突だと切り分いた。機序：narrow-steady-spurは「狭帯域 かつ 定常(観測間std小)」で発火。13ms窓ではadvバーストの有無で観測間エネルギーが激しく変動→非定常→BLE通過（Entry①のゲートランで1.2MHzは全SAVE）。400ms窓では1窓に数バーストが入り平均化→観測間std小→定常誤認→BLE棄却。**400msが、ゲートが頼る"時間変動"の手がかりを消した**。
+
+**解決＝窓長を用途で分ける（ゲートは不変）**
+標準ルール「narrow-steady-spurはBLE収集失敗を理由に触らない」通り、ゲートは正しく、壊れたのは窓長。よって: (1) **BLE収集は既定13ms**（`--capture-ms`無し。時間変動が保たれBLEが通る。ch38実証済みレシピ）、(2) **400msはゲート無しのduty解析専用**（`--capture-ms`は無駄でなく用途が違うだけ）。「duty審判は長尺要求／narrow-steady-spurは時間変動要求」の矛盾を、同じ窓に両方させないことで解く。
+
+**訂正の記録**：Claudeの「2402を広帯域が支配」は誤読。実体はイヤホンFHSSで、電源OFFで消滅。次セッションが同じ誤読をしないよう明記。
+
+---
+
+## エントリ 2026-07-09: ch37 ground truth 確定 ＋ CC提案ツール導入
+
+### 狙い
+ラン2で得たBLE ch37 adv候補を human確定し ground truth 2チャネル目を達成する。確定作業のミス（タイムスタンプ名の取り違え・2400スプリアス誤確定）を減らすため、CC提案ツールをサンドボックスで導入する。
+
+### やったこと
+1. **CC提案ツール `cnntrain/review_suggest.py`（サンドボックス・新規）** をCCに実装させた（指示書丸投げ）。対象ごとに duty（dutyprobe流用）・freq/bw/snr・spur_suspect を集め、CCがPNGを視覚分類（ble-adv/wifi/spurious/hopping）＋根拠を付し、`bench/review_suggest_ch37/` にCSVと確定シートを出力。**CCは確定しない・SigMFに書かない**。スプリアスガード（det 2400±0.1 か spur_suspect=True → skip強制）をコードで強制。
+2. **`review.py` に `--pattern GLOB` 追加（追加のみ）**。`2402MHz_1783530*` で今日の4件だけをレビュー列に出せる。apply_label・既存モード不変。
+3. **人間確定（review.py）**：CC提案を参考に、PNGを自分の目で確認して確定。
+
+### 分かったこと / 結果
+1. **ch37 ground truth 達成（2チャネル目）**。BLE adv 3件（`_413566_0` / `_460361_1` / `_864501_3`、det≈2402）を human確定（method=human）。ch38の3件と合わせ**2チャネル・計6件**。プロジェクト最大のボトルネックだったground_truth蓄積が明確に前進。
+2. **WiFi 1件（`_778007_2`）を能動再ラベル**。skipせず [4]WiFi(2.4GHz) として確定＝棄却対象のWiFiを"WiFiである"と正しく記録（次に見る人/CNNのため）。
+3. **CC提案の的中**：`_0/_1/_3→ble-adv`、`_2→wifi`。人間の目・Claudeの目と**3者一致**。
+4. **duty の限界を実証**：WiFi(`_2`)の duty も 0.014 と低く、**duty(burst/continuous)ではWiFiとBLEを分離できない**。決め手は周波数構造（上下貫通 vs 帯域内狭バースト）＝視覚。duty審判は「間欠か連続か」専用で信号種の同定はしない。
+
+### CCの実力について（3点目のデータ）
+- **設計思想に隣接する微妙な一線（"提案はするが確定はしない"）をCCが自分で守り切った**。apply_labelを触らず、method=humanを付けず、SigMFに書かず、スプリアスをconfirmにしない——全部指示書通り。**枠が明確なら思想の要に隣接する作業でもCCは逸脱しない**。
+- ただし**"CCが人間より精確か"はまだ未決**。今日も自明な4件（明快なBLE vs 明快なWiFi）で判別力あるケースではない。持ち越し#2のまま。
+
+### この日の成果物
+- `cnntrain/review_suggest.py`（提案ツール・新規、dutyprobe流用）。
+- `tests/test_review_suggest.py`（+9、既存無変更 → 194 passed / 3 skipped）。
+- `review.py` に `--pattern`（追加のみ、apply_label不変）。
+- `bench/review_suggest_ch37/`（suggestions.csv / confirm_sheet.md / cc_verdicts.csv）＝サンドボックス。
+- **ground truth**: BLE ch37 adv 3件 method=human（＋WiFi 1件 method=human）。
 
 ---
 
 ## 未解決・持ち越し
 1. ~~**capture IQ長のCLIノブ**~~ → **【解決 2026-07-08 CC】** 既存フラグ無しを確認し `--capture-ms MS` を追加（`config.dwell_samples_for_ms` + main.py 新フラグ。dwell.py/scheduler.py/spec.py/sigmf_io.py 不変、凍結 diff 空、185 passed）。sim で保存IQ長=capture-ms を実証。長尺収集のメモリ注意は Entry② の CC実装ノート参照。
-2. **長尺＋hardケースでの人間vsCC精確性ベンチマーク**。今回は判別力ゼロ。duty 0.5–0.9帯の微妙なバースト・WiFi+BLE重畳など「両者が食い違い得るケース」を混ぜて初めて判定者の優劣が測れる。
+2. **長尺＋hardケースでの人間vsCC精確性ベンチマーク**（未決）。Entry③でCCは"提案はするが確定しない"線を守り、提案は人間確定と3者一致したが、**いずれも自明ケース**（明快なBLE vs 明快なWiFi）で判別力は測っていない。器＝`review_suggest`（提案と人間確定を分離記録）が整ったので、duty 0.5–0.9帯の微妙なバースト・WiFi+BLE重畳など「両者が食い違い得るケース」を混ぜれば初めて優劣が測れる。
 3. **ch39(2480)収集**: 40MHz高調波(2480)のド真ん中 → `--dwell-offset-hz 4e6` の初実戦投入候補。
-4. **dutyprobe の位置づけ**: あくまで測定（時間占有）。BLE/非BLEラベルにも教師にも使わない。
+4. **dutyprobe の位置づけ**: あくまで測定（時間占有＝burst/continuous）。**WiFiとBLEは両方低dutyで分離不能**（Entry③実証）＝信号種の同定はしない。BLE/非BLEラベルにも教師にも使わない。
+
+---
+
+## 確定した設計判断・教訓（このセッション）
+- **窓長は用途で分ける**（Entry②）：BLE収集は既定13ms（時間変動が保たれnarrow-steady-spurがBLEを通す）／duty解析は400ms・ゲート無し。同じ窓に両立させない。ゲート(narrow-steady-spur)は不変。
+- **収集前に部屋の全2.4GHz機器を管理**（Entry②）：BluetoothイヤホンのFHSSが2402を占有し交絡（教訓7再演）。イヤホンも管理リストに入れる。
+- **CCは"提案はするが確定しない"を守れる**（Entry③）：枠が明確なら思想の要に隣接する作業でも逸脱しない。ただし視覚精確性の人間超えは未実証。
+- **確立した収集レシピ**：collect(13ms) → view_captures → review_suggest(CC提案・サンドボックス) → review.py(人間確定・PNG目視) の一周でground truthを積める。
