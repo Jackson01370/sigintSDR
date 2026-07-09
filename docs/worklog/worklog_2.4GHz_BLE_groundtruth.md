@@ -10,7 +10,7 @@
 ## このログのスコープ
 
 BLE advertising の ground truth を 2.4GHz ISM で積む取り組みの記録。
-- **主目標**: BLE adv を各チャネルで human確定して ground truth を貯める。**ch38(2426)・ch37(2402) 達成済み（各3件、method=human。計6件）**。ch39(2480) が次。
+- **主目標**: BLE adv を各チャネルで human確定して ground truth を貯める。**ch38(2426) 3件・ch37(2402) 17件 達成済み（method=human。計20件）**。ch39(2480) が次。
 - **副次目標**: dc-spike説の白黒 —「DC上に乗った間欠BLEが dc-spike ゲートで落ちるか」。過去に「必ず落ちる」と結論しオフセット実装の動機にしたが、要再検証に格下げ済み。**→ Entry①②で「白」寄りが補強：オンDCの間欠BLEはdc-spikeで落ちない（落ちるのは別ゲート narrow-steady-spur、しかも13msでは落ちない）**。
 
 ### プロジェクト背景（1分版）
@@ -173,11 +173,38 @@ Entry② の前提ブロッカー「capture長のCLIノブ」を CC が解決。
 
 ---
 
+## エントリ 2026-07-09 ②: ch37 厚み足し（13ms収集・14件確定）＋ review_suggest の穴発覚
+
+### 狙い
+Entry②で確定した設計判断（BLE収集は13ms）でch37の厚みを足し、CNN再学習に向けた件数を稼ぐ。同じレシピ（collect→view→review_suggest→review）を13msで回す。
+
+### やったこと
+1. **13ms収集**（イヤホンOFF維持・`--capture-ms`無し=既定13ms・dwell10s・persist0.2、窓2.4018–2.4022）→ **14件SAVE**（新バッチ `2402MHz_178356*`）。
+2. review_suggest に新バッチを通す（`--pattern "2402MHz_178356*"`、出力 `bench/review_suggest_ch37_b/`）。
+3. review.py で人間確定。
+
+### 分かったこと / 結果
+1. **13msで narrow-steady-spur × BLE の衝突が消えた**。400msの棄却地獄（Entry②）が消滅し、SNR24–30dB・1.1–1.3MHzのBLEがSAVE連発。**Entry②の窓長判断（収集は13ms）を実証**。
+2. **ch37 adv 14件を human確定**（全PNGが検出帯≈2402内の明快な離散バースト・2400線と分離・spur_suspect=False）。**ch37 計17件（Entry③の3＋今回14）・全体計20件**。CNN再学習の厚みに前進。件名周波数表示は tuner中心≈2401.9 だが実信号は annotation 側（2402近傍）が正。
+3. **review_suggest の穴発覚（重要）**：13msで duty が inconclusive になり、**CCが視覚分類を埋めず全14件を skip・`cc_class`空欄で提案**＝提案が空振り。原因は**指示書がinconclusive時の視覚分類フォールバックを明示していなかった**（枠の穴。前回400msでは同じ種類の信号を正しく ble-adv にした＝**CCの視覚能力の限界ではない**）。CCは"提案しない(全skip)"側に倒れた＝**安全側の失敗でラベル汚染ゼロ**。今回は人間がPNG目視で確定して回避（全14件を[5]BLEで確定、PNGで離散バースト＋2400線分離を確認済み）。
+
+### CCの実力について（3.5点目のデータ）
+- 道具の目的（提案を速く・正確に）は今回**果たせなかった**が、壊れ方は"確定してはいけないものを確定する"でなく"何も提案しない"＝**安全側**。汚染を1件も生んでいない。
+- 修正すべきは**指示書/ツール側**（inconclusive時もCCが視覚分類を必ず埋める）であって、CCの視覚判断ではない。前回400msで同種信号を正しく分類済み。
+
+### この日の成果物
+- **ground truth**: BLE ch37 adv 14件 method=human（ch37 累計17件）。
+- `bench/review_suggest_ch37_b/`（confirm_sheet.md 等＝**空振り提案**。反面教師として保持）。
+- コード変更なし（既存の review_suggest / review.py --pattern を使用）。
+
+---
+
 ## 未解決・持ち越し
 1. ~~**capture IQ長のCLIノブ**~~ → **【解決 2026-07-08 CC】** 既存フラグ無しを確認し `--capture-ms MS` を追加（`config.dwell_samples_for_ms` + main.py 新フラグ。dwell.py/scheduler.py/spec.py/sigmf_io.py 不変、凍結 diff 空、185 passed）。sim で保存IQ長=capture-ms を実証。長尺収集のメモリ注意は Entry② の CC実装ノート参照。
 2. **長尺＋hardケースでの人間vsCC精確性ベンチマーク**（未決）。Entry③でCCは"提案はするが確定しない"線を守り、提案は人間確定と3者一致したが、**いずれも自明ケース**（明快なBLE vs 明快なWiFi）で判別力は測っていない。器＝`review_suggest`（提案と人間確定を分離記録）が整ったので、duty 0.5–0.9帯の微妙なバースト・WiFi+BLE重畳など「両者が食い違い得るケース」を混ぜれば初めて優劣が測れる。
 3. **ch39(2480)収集**: 40MHz高調波(2480)のド真ん中 → `--dwell-offset-hz 4e6` の初実戦投入候補。
 4. **dutyprobe の位置づけ**: あくまで測定（時間占有＝burst/continuous）。**WiFiとBLEは両方低dutyで分離不能**（Entry③実証）＝信号種の同定はしない。BLE/非BLEラベルにも教師にも使わない。
+5. **review_suggest の inconclusive 対応**（改修候補・Entry④で判明）: 13ms収集ではdutyがinconclusiveになり、CCが視覚分類を埋めず全skipで出た＝提案空振り。**13msが主レシピなので review_suggest は duty 非依存でも機能する必要**がある。改修＝「dutyが結論不能でも、CCの視覚分類＋メタ(BW/spur_suspect)＋スプリアスガードで recommend を出す」。指示書に「inconclusive時もCCが視覚分類を必ず埋める」を明示。dutyは補助列、主判定は視覚、に寄せる。
 
 ---
 
@@ -186,3 +213,4 @@ Entry② の前提ブロッカー「capture長のCLIノブ」を CC が解決。
 - **収集前に部屋の全2.4GHz機器を管理**（Entry②）：BluetoothイヤホンのFHSSが2402を占有し交絡（教訓7再演）。イヤホンも管理リストに入れる。
 - **CCは"提案はするが確定しない"を守れる**（Entry③）：枠が明確なら思想の要に隣接する作業でも逸脱しない。ただし視覚精確性の人間超えは未実証。
 - **確立した収集レシピ**：collect(13ms) → view_captures → review_suggest(CC提案・サンドボックス) → review.py(人間確定・PNG目視) の一周でground truthを積める。
+- **review_suggest は視覚主・duty補助であるべき**（Entry④）：13ms主レシピではdutyがinconclusiveになるので、提案の主判定はCCの視覚＋メタ＋スプリアスガード、dutyは補助列。inconclusive時に全skipで倒れたのは指示書の穴で、CCの視覚能力の問題ではない。
