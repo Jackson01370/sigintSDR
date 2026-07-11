@@ -9,14 +9,16 @@
   * スプリアス誤確定ガード（原則4）: det_freq が 2400.0±0.1MHz、または spur_suspect=True の行は
     spurious_warn=True とし、cc_class が何であれ recommend=skip を**コードで強制**する。
   * CC(あなた)が PNG を見て付けた視覚分類 cc_class と根拠 cc_rationale を（--verdicts CSV で）併合。
-  * recommend は spurious_warn と cc_class から決定的に決める:
-      spurious_warn==True            -> skip（最優先・誤確定ガード）
+  * recommend は **cc_class 主導・duty 非依存**で決める（decide_recommend・優先順）:
+      spurious_warn==True            -> skip（最優先・誤確定ガード・不変）
+      cc_class 空/None               -> needs-review（人間に必ず提示。黙って skip しない）
       cc_class=='ble-adv'（warn無し） -> confirm-ble
-      それ以外                        -> skip
+      それ以外(wifi/spurious/hopping/unclear) -> skip
+    duty・duty_inconclusive は分岐に**使わない**（表示専用の補助列）。13ms=inconclusive でも機能する。
 
 出力:
   * bench/<out>/suggestions.csv  … 全列（客観 + cc_class + cc_rationale + recommend）
-  * bench/<out>/confirm_sheet.md … 人間の確定チェックリスト（3節 + 正直バナー）
+  * bench/<out>/confirm_sheet.md … 人間の確定チェックリスト（4節 + 正直バナー）
 
 正直な限定:
   * 提案 != 確定。最終承認は人間が PNG を見て review.py で行う。CC は method=human を付与しない。
@@ -52,6 +54,7 @@ BANNER = (
     "CC は SigMF を書き換えていない（captures/ は読み取りのみ）。method=human は付与していない。",
     "duty は時間占有の測定でありラベルではない。duty も cc_class も CNN 学習入力にしない。",
     "スプリアス誤確定ガード: det≈2400.0MHz または spur_suspect=True は cc_class に関わらず skip 強制。",
+    "recommend は duty ではなく cc_class(視覚)で決定。duty が inconclusive(13ms収録)でも機能する。duty は補助列。",
 )
 
 
@@ -83,10 +86,22 @@ def spurious_warn_for(det_freq_mhz: float, spur_suspect: bool) -> bool:
     return bool(near_spur or bool(spur_suspect))
 
 
-def recommend_for(spurious_warn: bool, cc_class: str) -> str:
-    """recommend を決定的に決める。spurious_warn が最優先（誤確定ガード）。"""
+def decide_recommend(spurious_warn: bool, cc_class: str | None) -> str:
+    """recommend を **cc_class 主導・duty 非依存**で決める（duty を引数に取らない）。
+
+      1. spurious_warn==True    -> skip（最優先ガード・cc_class 不問・不変）
+      2. cc_class 空/None       -> needs-review（人間に必ず提示。黙って skip しない）
+      3. cc_class=='ble-adv'    -> confirm-ble
+      4. それ以外               -> skip（wifi/spurious/hopping/unclear）
+
+    duty・duty_inconclusive は分岐条件に**一切使わない**（構造的に duty 非依存）。
+    13ms 収録で duty=inconclusive でも cc_class='ble-adv' なら confirm-ble を出せる
+    （前回の「inconclusive→全skip 空振り」の穴をコードで塞ぐ）。
+    """
     if spurious_warn:
-        return "skip"                      # cc_class が何であれ skip 強制
+        return "skip"                      # cc_class が何であれ skip 強制（最優先）
+    if not cc_class or cc_class.strip() == "":
+        return "needs-review"              # 未記入は黙って skip せず人間へ回す
     if cc_class == "ble-adv":
         return "confirm-ble"
     return "skip"
@@ -142,7 +157,8 @@ def collect_one(path_base: str, data_dir: str) -> SuggestRecord | None:
         rule_confidence=(round(float(rule_conf), 3) if rule_conf is not None else None),
         duty=round(float(m["duty"]), 4), duty_inconclusive=bool(duty_inconclusive),
         spur_suspect=spur_suspect, spurious_warn=warn,
-        recommend=recommend_for(warn, ""),   # cc_class 未記入時は skip（安全側）
+        # cc_class 未記入の既定は needs-review（spurious なら guard で skip）。
+        recommend=decide_recommend(warn, ""),
     )
 
 
@@ -167,7 +183,7 @@ def apply_verdicts(records: list[SuggestRecord],
             cc_class, cc_rationale = v
             r.cc_class = cc_class
             r.cc_rationale = cc_rationale
-        r.recommend = recommend_for(r.spurious_warn, r.cc_class)   # 常にガードを通す
+        r.recommend = decide_recommend(r.spurious_warn, r.cc_class)  # 常にガードを通す
     return records
 
 
@@ -231,6 +247,7 @@ def format_confirm_sheet(records: list[SuggestRecord], data_dir: str,
                          pattern: str) -> str:
     confirm = [r for r in records if r.recommend == "confirm-ble"]
     skip = [r for r in records if r.recommend == "skip"]
+    needs = [r for r in records if r.recommend == "needs-review"]
     warns = [r for r in records if r.spurious_warn]
 
     md: list[str] = []
@@ -241,8 +258,13 @@ def format_confirm_sheet(records: list[SuggestRecord], data_dir: str,
         md.append(f"> - {b}  ")
     md.append("")
     md.append(f"対象: `{data_dir}` の `{pattern}` 一致 {len(records)} 件。"
-              "duty は `cnntrain.dutyprobe` を流用（400ms 収録なら inconclusive=False）。")
+              "duty は `cnntrain.dutyprobe` を流用（400ms 収録なら inconclusive=False）。"
+              "recommend は cc_class(視覚)主導で duty 非依存＝13ms=inconclusive でも機能する。")
     md.append("")
+    if needs:
+        md.append(f"> ⚠ **視覚分類 未記入 {len(needs)} 件 → needs-review**。"
+                  "CC が PNG を確認し cc_class を埋め直すこと（黙って skip にしない）。")
+        md.append("")
     md.append("**人間の手順**: `review.py captures/ --pattern \"" + pattern + "\"` で対象だけを列に出し、"
               "下表と照合。confirm-ble の行のみ PNG で BLE adv（離散バースト・2400線と分離）を"
               "確認してから確定（yes）。skip は確定しない。**承認判断は人間が握る（提案の鵜呑み禁止）**。")
@@ -264,6 +286,16 @@ def format_confirm_sheet(records: list[SuggestRecord], data_dir: str,
         md.extend(_row(r) for r in skip)
     else:
         md.append("(なし)")
+    md.append("")
+
+    md.append(f"## 🔎 Needs-review（視覚分類 未記入・要目視） — {len(needs)} 件")
+    if needs:
+        md.append("CC が cc_class を埋め忘れた行。黙って skip せず人間に必ず提示する（前回の空振り穴の再発防止）。")
+        md.append("| file | det_freq(MHz) | bw(MHz) | duty | cc_class | rationale |")
+        md.append("|---|---|---|---|---|---|")
+        md.extend(_row(r) for r in needs)
+    else:
+        md.append("(なし) — 全件で cc_class が記入済み。")
     md.append("")
 
     md.append(f"## ⚠ Warnings（spurious_warn=True・誤確定ガード発火） — {len(warns)} 件")
@@ -338,9 +370,14 @@ def main(argv=None) -> int:
     print("=" * 74)
     n_conf = sum(1 for r in records if r.recommend == "confirm-ble")
     n_skip = sum(1 for r in records if r.recommend == "skip")
+    n_needs = sum(1 for r in records if r.recommend == "needs-review")
     n_warn = sum(1 for r in records if r.spurious_warn)
     print(f"  対象 {len(records)} 件  confirm-ble={n_conf}  skip={n_skip}  "
-          f"spurious_warn={n_warn}  (verdicts={'有' if verdicts else '無'})")
+          f"needs-review={n_needs}  spurious_warn={n_warn}  "
+          f"(verdicts={'有' if verdicts else '無'})")
+    if n_needs:
+        print(f"  ⚠ 視覚分類 未記入 {n_needs} 件 → needs-review。"
+              "CC が PNG を見て cc_class を埋めること（黙って skip にしない）。")
     print(f"  CSV  : {csv_path}")
     print(f"  Sheet: {sheet_path}")
     return 0

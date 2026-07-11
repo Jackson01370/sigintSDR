@@ -41,13 +41,20 @@ def test_spurious_warn_logic():
 # (2) recommend 制約（誤確定ガード）
 # ---------------------------------------------------------------------------
 def test_recommend_constraint():
-    for c in rs.CC_CLASSES:                     # spurious_warn=True は必ず skip
-        assert rs.recommend_for(True, c) == "skip", c
-    assert rs.recommend_for(False, "ble-adv") == "confirm-ble"
-    assert rs.recommend_for(False, "wifi") == "skip"
-    assert rs.recommend_for(False, "spurious") == "skip"
-    assert rs.recommend_for(False, "hopping") == "skip"
-    assert rs.recommend_for(False, "") == "skip"
+    """recommend は cc_class 主導・duty 非依存。spurious ガード最優先、空は needs-review。"""
+    for c in rs.CC_CLASSES:                     # spurious_warn=True は必ず skip（不変）
+        assert rs.decide_recommend(True, c) == "skip", c
+    assert rs.decide_recommend(True, "") == "skip"        # 空でも spurious なら skip
+    assert rs.decide_recommend(True, None) == "skip"
+    assert rs.decide_recommend(False, "ble-adv") == "confirm-ble"
+    assert rs.decide_recommend(False, "wifi") == "skip"
+    assert rs.decide_recommend(False, "spurious") == "skip"
+    assert rs.decide_recommend(False, "hopping") == "skip"
+    assert rs.decide_recommend(False, "unclear") == "skip"
+    # 未記入(空/None/空白)は needs-review（黙って skip しない＝今回の芯）
+    assert rs.decide_recommend(False, "") == "needs-review"
+    assert rs.decide_recommend(False, None) == "needs-review"
+    assert rs.decide_recommend(False, "   ") == "needs-review"
 
 
 def test_apply_verdicts_enforces_guard(tmp_path):
@@ -59,6 +66,43 @@ def test_apply_verdicts_enforces_guard(tmp_path):
     rs.apply_verdicts([r], {"x": ("ble-adv", "誤って ble と付けた")})
     assert r.cc_class == "ble-adv"
     assert r.recommend == "skip"                # ガードが confirm-ble を握り潰す
+
+
+def test_decide_recommend_duty_independent():
+    """前回の穴のロック: duty=inconclusive でも cc_class='ble-adv' なら confirm-ble。
+    decide_recommend は duty を引数に取らない（構造的に duty 非依存）。"""
+    import inspect
+    params = list(inspect.signature(rs.decide_recommend).parameters)
+    assert params == ["spurious_warn", "cc_class"]        # duty 系引数を持たない
+    assert not any("duty" in p for p in params)
+    # end-to-end: duty_inconclusive=True の record でも confirm-ble になる。
+    r = rs.SuggestRecord(
+        record="y", png="(なし)", det_freq_mhz=2402.0, bw_mhz=1.2, snr_db=25.0,
+        rule_label="BLE/Bluetooth (adv?)", rule_confidence=0.62,
+        duty=0.0, duty_inconclusive=True, spur_suspect=False, spurious_warn=False)
+    rs.apply_verdicts([r], {"y": ("ble-adv", "離散バースト・2400線分離")})
+    assert r.duty_inconclusive is True                    # duty は結論不能のまま
+    assert r.recommend == "confirm-ble"                   # それでも confirm-ble（duty 非依存）
+
+
+def test_needs_review_detection_and_warning():
+    """cc_class 未記入(非スプリアス)は needs-review になり、シートに件数付き警告＋節が出る。"""
+    def _rec(name):
+        return rs.SuggestRecord(
+            record=name, png="(なし)", det_freq_mhz=2402.0, bw_mhz=1.1, snr_db=24.0,
+            rule_label="BLE", rule_confidence=0.62, duty=0.01, duty_inconclusive=True,
+            spur_suspect=False, spurious_warn=False)
+    filled, blank = _rec("rec_filled"), _rec("rec_blank")
+    recs = [filled, blank]
+    rs.apply_verdicts(recs, {"rec_filled": ("ble-adv", "離散バースト")})  # blank は未記入
+    assert filled.recommend == "confirm-ble"
+    assert blank.recommend == "needs-review"              # 空欄は黙って skip されない
+
+    sheet = rs.format_confirm_sheet(recs, "captures/", "*")
+    assert "未記入 1 件" in sheet                          # 冒頭の件数付き警告
+    assert "Needs-review（視覚分類 未記入・要目視） — 1 件" in sheet   # 4節目
+    assert "Confirm as BLE ch37（recommend=confirm-ble） — 1 件" in sheet
+    assert "rec_blank" in sheet                           # 未記入行がシートに出る
 
 
 # ---------------------------------------------------------------------------
