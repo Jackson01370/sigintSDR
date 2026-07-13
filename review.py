@@ -15,6 +15,8 @@ CLI:
     python3 -m dataset review captures/         # 同じ導線（dataset サブコマンド）
 """
 from __future__ import annotations
+import csv
+import datetime
 import glob
 import json
 import os
@@ -28,6 +30,24 @@ REVIEW_METHOD = "human"
 # CNN 監査 (C) = 「ルールと CNN が食い違い、確定を人手に委ねる」verdict の内部値。
 # global の sigscan:cnn_verdict に格納される（cnntrain M3 が書き込む）。
 C_CONFLICT = "C-conflict"
+
+# cc_class(視覚分類) → 確定ラベル文字列の写像（1箇所に定義）。hopping/spurious/
+# unclear は写像なし＝○×UI で y(提案確定)を出せない（ラベル選択を強制）。
+CC_CLASS_TO_LABEL = {
+    "ble-adv": "BLE/Bluetooth (adv?)",
+    "wifi": "WiFi (2.4GHz, 20/40MHz)",
+}
+
+
+def cc_class_to_label(cc_class: str | None) -> str | None:
+    """cc_class を確定ラベル文字列へ写像。写像が無ければ None。"""
+    return CC_CLASS_TO_LABEL.get((cc_class or "").strip())
+
+
+def _now_iso() -> str:
+    """UTC ISO タイムスタンプ（sigmf_io と同形式）。relabel 履歴の at 用。"""
+    return datetime.datetime.now(datetime.timezone.utc).strftime(
+        "%Y-%m-%dT%H:%M:%S.%fZ")
 
 
 def _force_utf8():
@@ -57,14 +77,18 @@ def candidate_labels() -> list[str]:
 
 
 def find_low_confidence(dirpath: str, conf_max: float = 0.5,
-                        pattern: str | None = None) -> list[dict]:
+                        pattern: str | None = None,
+                        include_human: bool = False) -> list[dict]:
     """method=='rule' かつ confidence<conf_max のアノテーションを列挙。
 
     pattern 指定時はファイル名(ベース)が pattern に一致する *.sigmf-meta だけを走査
     する（既定 None＝全 *.sigmf-meta で従来どおり）。conf_max による絞りは不変。
 
+    include_human=True のとき、method=='human'（確定済み）のレコードも confidence に
+    関わらず対象に含める（訂正経路）。既定 False＝従来どおり rule のみ（後方互換）。
+
     returns: [{meta_path, ann_index, meta, ann, center, bw, label, confidence,
-               snr_db, hw, datetime}, ...]
+               method, snr_db, hw, datetime}, ...]
     """
     items: list[dict] = []
     glob_pat = (pattern + ".sigmf-meta") if pattern else "*.sigmf-meta"
@@ -82,9 +106,12 @@ def find_low_confidence(dirpath: str, conf_max: float = 0.5,
         for i, ann in enumerate(meta.get("annotations") or []):
             method = ann.get("sigscan:method")
             conf = ann.get("sigscan:confidence")
-            if method != "rule" or conf is None:
-                continue
-            if float(conf) >= conf_max:
+            if method == "rule":
+                if conf is None or float(conf) >= conf_max:
+                    continue
+            elif include_human and method == "human":
+                pass   # 訂正経路: 確定済みを confidence に関わらず対象に含める
+            else:
                 continue
             lo = ann.get("core:freq_lower_edge")
             hi = ann.get("core:freq_upper_edge")
@@ -92,7 +119,9 @@ def find_low_confidence(dirpath: str, conf_max: float = 0.5,
             items.append(dict(
                 meta_path=meta_path, ann_index=i, meta=meta, ann=ann,
                 center=float(cap0.get("core:frequency", 0.0)), bw=bw,
-                label=ann.get("core:label"), confidence=float(conf),
+                label=ann.get("core:label"),
+                confidence=float(conf) if conf is not None else 0.0,
+                method=method,
                 snr_db=ann.get("sigscan:snr_db"), hw=g.get("core:hw", ""),
                 datetime=cap0.get("core:datetime"),
             ))
@@ -183,12 +212,17 @@ def _png_path_for(meta_path: str) -> str | None:
 
 
 def apply_label(meta_path: str, ann_index: int, new_label: str,
-                method: str = REVIEW_METHOD, confidence: float = 1.0) -> dict:
+                method: str = REVIEW_METHOD, confidence: float = 1.0,
+                record_history: bool = False, at: str | None = None) -> dict:
     """meta JSON の指定アノテーションを再ラベルし書き戻す（生IQには触れない）。
 
     core:label を new_label に、sigscan:method を method('human') に、
     sigscan:confidence を confidence(1.0) に更新。元ラベルは comment に残す。
     sigmf_io.write_recording と同じ整形（indent=2, ensure_ascii=False）で保存。
+
+    record_history=True のとき、annotation の sigscan:relabel_history に
+    {from,to,from_method,at} を **append** する（訂正の履歴。過去の確定を黙って
+    上書きしない）。既定 False＝従来挙動（履歴キーを足さない・完全後方互換）。
     returns: 更新後の annotation dict。
     """
     # 読み書きとも sigmf_io（ロケール既定エンコーディング）に合わせ、書き戻した
@@ -208,6 +242,13 @@ def apply_label(meta_path: str, ann_index: int, new_label: str,
     note = f"human-relabeled (was '{old_label}' via {old_method})"
     existing = ann.get("core:comment")
     ann["core:comment"] = f"{existing} | {note}" if existing else note
+    if record_history:
+        hist = ann.get("sigscan:relabel_history")
+        if not isinstance(hist, list):
+            hist = []
+        hist.append({"from": old_label, "to": str(new_label),
+                     "from_method": old_method, "at": at or _now_iso()})
+        ann["sigscan:relabel_history"] = hist
 
     with open(meta_path, "w") as f:
         json.dump(meta, f, indent=2, ensure_ascii=False)
@@ -253,7 +294,7 @@ def _print_item(item: dict, print_fn) -> None:
 
 def run_review(dirpath: str, conf_max: float = 0.5,
                input_fn=input, print_fn=print, verdict: str | None = None,
-               pattern: str | None = None) -> int:
+               pattern: str | None = None, include_human: bool = False) -> int:
     """対話で低信頼アノテーションを再ラベルする。
 
     input_fn / print_fn は差し替え可能（テスト用）。input_fn が空文字や 's' を
@@ -268,10 +309,13 @@ def run_review(dirpath: str, conf_max: float = 0.5,
         header = (f"CNN監査(C)レビュー: sigscan:cnn_verdict=='{C_CONFLICT}' の記録 "
                   f"{len(items)} 件（対象ディレクトリ: {dirpath}）")
     else:
-        items = find_low_confidence(dirpath, conf_max=conf_max, pattern=pattern)
+        items = find_low_confidence(dirpath, conf_max=conf_max, pattern=pattern,
+                                    include_human=include_human)
         _scope = (f"confidence<{conf_max}" if conf_max != float("inf") else "全信頼度")
         if pattern:
             _scope += f" / pattern='{pattern}'"
+        if include_human:
+            _scope += " / +human(訂正対象)"
         header = (f"低信頼レビュー: method='rule' かつ {_scope} の"
                   f"アノテーション {len(items)} 件（対象ディレクトリ: {dirpath}）")
     cands = candidate_labels()
@@ -316,21 +360,191 @@ def run_review(dirpath: str, conf_max: float = 0.5,
     return 0
 
 
+# ===========================================================================
+# ○×UI（--suggest）: CC 提案を y/n で確定。摩擦=安全弁で y 連打素通りを防ぐ。
+# ===========================================================================
+def _read_suggestions(path: str) -> list[dict]:
+    """review_suggest の suggestions.csv を読む（先頭 '#' コメント行を飛ばす）。"""
+    with open(path, encoding="utf-8") as f:
+        lines = [ln for ln in f if not ln.startswith("#")]
+    return list(csv.DictReader(lines))
+
+
+def _first_band_ann_index(meta: dict):
+    """band を持つ最初の annotation の (index, ann)。無ければ (0,ann0) / (None,None)。"""
+    anns = meta.get("annotations") or []
+    for i, a in enumerate(anns):
+        if (a.get("core:freq_lower_edge") is not None
+                and a.get("core:freq_upper_edge") is not None):
+            return i, a
+    if anns:
+        return 0, anns[0]
+    return None, None
+
+
+def _y_blocked_reason(cc_class: str | None, spurious_warn: bool,
+                      recommend: str | None) -> str:
+    """○×UIで y(提案確定)を出してよいか。出せない理由文字列を返す（''＝y提示可）。
+
+    安全弁（Pattern A 化＝AI出力が素通りで ground truth 化するのを防ぐ）: 次のいずれ
+    かなら y を出さず、ラベル一覧を強制表示する:
+      - spurious_warn==True / cc_class 未記入(needs-review) / cc_class=='unclear'
+      - cc_class に確定ラベル写像が無い（hopping/spurious 等）
+    """
+    if spurious_warn:
+        return "スプリアス警告(spurious_warn=True)"
+    if recommend == "needs-review" or not (cc_class or "").strip():
+        return "視覚分類 未記入(needs-review)"
+    if cc_class == "unclear":
+        return "CCが unclear と判定"
+    if cc_class_to_label(cc_class) is None:
+        return f"cc_class='{cc_class}' はラベル写像なし"
+    return ""
+
+
+def _prompt_label(cands: list[str], input_fn, print_fn):
+    """ラベル一覧を出して選ばせる。returns (kind, label): kind∈{'label','skip','quit'}。"""
+    print_fn("\n候補ラベル:")
+    for i, c in enumerate(cands):
+        print_fn(f"  [{i:2d}] {c}")
+    try:
+        ans = input_fn("  正しい label を入力（番号/自由入力 / s=スキップ / q=終了）> ")
+    except EOFError:
+        return ("quit", None)
+    ans = (ans or "").strip()
+    if ans.lower() == "q":
+        return ("quit", None)
+    if ans == "" or ans.lower() == "s":
+        return ("skip", None)
+    if ans.isdigit() and 0 <= int(ans) < len(cands):
+        return ("label", cands[int(ans)])
+    return ("label", ans)
+
+
+def run_suggest_review(dirpath: str, suggest_csv: str,
+                       input_fn=input, print_fn=print,
+                       include_human: bool = False, apply_fn=None) -> int:
+    """○×UI: suggestions.csv の CC 提案を y/n で確定する（摩擦=安全弁つき）。
+
+    y=CC提案ラベルで確定 / n=ラベル一覧から人間が選ぶ / s=スキップ / q=終了。
+    安全弁: cc_class が unclear / spurious_warn=True / needs-review(未記入) のときは
+    y を出さず、ラベル一覧を強制表示する（提案の素通り＝Pattern A 化を構造で防ぐ）。
+    確定は apply_label（method=human, confidence=1.0, 履歴 record_history=True）。
+    include_human=False（既定）では確定済み(method=human)の行は提示せずスキップする。
+    """
+    apply_fn = apply_fn or apply_label
+    rows = _read_suggestions(suggest_csv)
+    cands = candidate_labels()
+    print_fn(f"○×UIレビュー: 提案 {len(rows)} 件（{suggest_csv}） "
+             f"include_human={include_human}")
+    changed = 0
+    for n, row in enumerate(rows, 1):
+        record = (row.get("record") or "").strip()
+        meta_path = os.path.join(dirpath, record + ".sigmf-meta")
+        if not record or not os.path.exists(meta_path):
+            print_fn(f"--- [{n}/{len(rows)}] {record or '(空)'}: meta 無し → スキップ")
+            continue
+        with open(meta_path) as f:
+            meta = json.load(f)
+        ann_index, ann = _first_band_ann_index(meta)
+        if ann is None:
+            print_fn(f"--- [{n}/{len(rows)}] {record}: annotation 無し → スキップ")
+            continue
+        cur_label = ann.get("core:label")
+        cur_method = ann.get("sigscan:method")
+        cur_conf = ann.get("sigscan:confidence")
+        persist = ann.get("sigscan:persistence")
+        if cur_method == "human" and not include_human:
+            print_fn(f"--- [{n}/{len(rows)}] {record}: 確定済み(human) → スキップ"
+                     "（訂正は --include-human）")
+            continue
+
+        cc_class = (row.get("cc_class") or "").strip()
+        cc_rationale = (row.get("cc_rationale") or "").strip()
+        spurious_warn = (row.get("spurious_warn") == "True")
+        recommend = (row.get("recommend") or "").strip()
+        proposed_label = cc_class_to_label(cc_class)
+        png = (row.get("png") or _png_path_for(meta_path) or "(なし)")
+
+        lines = [
+            f"--- [{n}/{len(rows)}] ---",
+            f"  file   : {os.path.basename(meta_path)}",
+            f"  PNG    : {png}",
+            f"  CC提案 : {proposed_label or '(写像なし)'}   [cc_class={cc_class or '未記入'}]",
+            f"  根拠   : {cc_rationale or '-'}",
+            f"  客観   : det={row.get('det_freq_mhz', '?')}MHz BW={row.get('bw_mhz', '?')}MHz "
+            f"SNR={row.get('snr_db', '?')}dB persist={persist if persist is not None else '?'} "
+            f"duty={row.get('duty', '?')}"
+            f"{'(inconclusive)' if row.get('duty_inconclusive') == 'True' else ''} "
+            f"spur={row.get('spurious_warn', '?')}",
+        ]
+        if cur_method == "human":
+            lines.append(f"  現在   : label='{cur_label}' "
+                         f"(confidence={cur_conf}, method={cur_method})  ← 訂正対象")
+        print_fn("\n".join(lines))
+
+        reason = _y_blocked_reason(cc_class, spurious_warn, recommend)
+        if reason == "":
+            try:
+                ans = input_fn("  この提案で確定してよいか？ "
+                               "[y=確定 / n=ラベル選択 / s=スキップ / q=終了] > ")
+            except EOFError:
+                print_fn("\n入力終了。中断します。")
+                break
+            ans = (ans or "").strip().lower()
+            if ans == "q":
+                print_fn("レビューを終了します。")
+                break
+            if ans in ("", "s"):
+                print_fn("  → スキップ")
+                continue
+            if ans == "y":
+                apply_fn(meta_path, ann_index, proposed_label, record_history=True)
+                changed += 1
+                print_fn(f"  → 確定: '{cur_label}' → '{proposed_label}' "
+                         f"(method=human, cc_class={cc_class})")
+                continue
+            # 'n' その他 → ラベル一覧へ
+        else:
+            print_fn(f"  ⚠ {reason} → 提案確定(y)は不可。ラベルを選択してください（skip 可）")
+
+        kind, new_label = _prompt_label(cands, input_fn, print_fn)
+        if kind == "quit":
+            print_fn("レビューを終了します。")
+            break
+        if kind == "skip":
+            print_fn("  → スキップ")
+            continue
+        apply_fn(meta_path, ann_index, new_label, record_history=True)
+        changed += 1
+        print_fn(f"  → 確定: '{cur_label}' → '{new_label}' (method=human)")
+
+    print_fn(f"\n完了: {changed} 件を確定しました。")
+    return 0
+
+
 def _cmd_list(dirpath: str, conf_max: float, verdict: str | None = None,
-              pattern: str | None = None) -> int:
+              pattern: str | None = None, include_human: bool = False) -> int:
     if verdict == "C":
         items = find_c_conflict(dirpath, pattern=pattern)
         print(f"CNN監査(C)記録 {len(items)} 件 (sigscan:cnn_verdict=='{C_CONFLICT}'):")
     else:
-        items = find_low_confidence(dirpath, conf_max=conf_max, pattern=pattern)
+        items = find_low_confidence(dirpath, conf_max=conf_max, pattern=pattern,
+                                    include_human=include_human)
         _scope = (f"confidence<{conf_max}" if conf_max != float("inf") else "全信頼度")
         if pattern:
             _scope += f", pattern='{pattern}'"
+        if include_human:
+            _scope += ", +human(訂正対象)"
         print(f"低信頼アノテーション {len(items)} 件 (method='rule', {_scope}):")
     for item in items:
         base = os.path.basename(item['meta_path'])
         head = (f"  {item['center']/1e6:9.3f}MHz  conf={item['confidence']:.2f}  "
                 f"'{item['label']}'  <{base}>")
+        # 訂正経路（--include-human）で拾った確定済みは訂正対象として明示。
+        # rule/cnn 経路は method!='human' なので付かない（後方互換）。
+        if item.get("method") == "human":
+            head += "  [method=human ← 訂正対象]"
         # CNN 来歴・保持候補・PNG パスは C 経路（cnn_verdict あり）でのみ付加。
         # 既定 rule 経路は cnn_verdict を持たないので従来行のまま（後方互換）。
         if item.get("cnn_verdict"):
@@ -365,6 +579,13 @@ def main(argv=None) -> int:
                    help="ファイル名(ベース)が GLOB に一致するレコードだけを対象にする"
                         "（例 \"2402MHz_1783530*\"）。特定レコードを狙い撃つ選別フィルタ。"
                         "--conf-max と併用で AND、単独なら信頼度に関わらず一致ファイルを対象")
+    p.add_argument("--suggest", default=None, metavar="CSV",
+                   help="review_suggest の suggestions.csv を読み CC提案を ○×UI(y/n)で確定。"
+                        "y=提案ラベルで確定 / n=ラベル選択。安全弁: unclear/spurious/未記入は"
+                        " y 不可（ラベル選択強制）。--list 併用時は列挙のみ（確定しない）")
+    p.add_argument("--include-human", action="store_true", dest="include_human",
+                   help="method=human の確定済みレコードも対象に含める（訂正経路）。"
+                        "--pattern と併用で特定の誤確定を呼び戻す。既定は rule のみ（従来）")
     args = p.parse_args(argv)
     # --conf-max 実効値: 明示指定を最優先。--pattern 単独なら信頼度を無視(inf)。
     #   どちらも無ければ従来既定 0.5（＝既存の対象選択・挙動は不変）。
@@ -374,11 +595,16 @@ def main(argv=None) -> int:
         conf_max = float("inf")
     else:
         conf_max = 0.5
-    if args.list:
+    # include_human は True のときだけ渡す（既定 False は各関数の既定に委ね、既存の
+    #   呼び出し・mock シグネチャとの後方互換を保つ）。
+    ih = {"include_human": True} if args.include_human else {}
+    if args.list:                       # --list は読み取りのみ（--suggest 併用でも列挙）
         return _cmd_list(args.dir, conf_max, verdict=args.verdict,
-                         pattern=args.pattern)
+                         pattern=args.pattern, **ih)
+    if args.suggest is not None:        # ○×UI（対話確定）
+        return run_suggest_review(args.dir, args.suggest, **ih)
     return run_review(args.dir, conf_max=conf_max, verdict=args.verdict,
-                      pattern=args.pattern)
+                      pattern=args.pattern, **ih)
 
 
 if __name__ == "__main__":

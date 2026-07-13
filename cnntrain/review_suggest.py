@@ -237,9 +237,8 @@ def write_suggestions_csv(out_dir: str, records: list[SuggestRecord]) -> str:
 
 
 def _row(r: SuggestRecord) -> str:
-    snr = "" if r.snr_db is None else f"{r.snr_db:.1f}dB"
     inc = " (inconclusive)" if r.duty_inconclusive else ""
-    return (f"| {r.record} | {r.det_freq_mhz:.2f} | {r.bw_mhz:.2f} | "
+    return (f"| {r.record} | {r.png} | {r.det_freq_mhz:.2f} | {r.bw_mhz:.2f} | "
             f"{r.duty:.3f}{inc} | {r.cc_class or '-'} | {r.cc_rationale or '-'} |")
 
 
@@ -272,8 +271,8 @@ def format_confirm_sheet(records: list[SuggestRecord], data_dir: str,
 
     md.append(f"## ✅ Confirm as BLE ch37（recommend=confirm-ble） — {len(confirm)} 件")
     if confirm:
-        md.append("| file | det_freq(MHz) | bw(MHz) | duty | cc_class | rationale |")
-        md.append("|---|---|---|---|---|---|")
+        md.append("| file | PNG | det_freq(MHz) | bw(MHz) | duty | cc_class | rationale |")
+        md.append("|---|---|---|---|---|---|---|")
         md.extend(_row(r) for r in confirm)
     else:
         md.append("(なし)")
@@ -281,8 +280,8 @@ def format_confirm_sheet(records: list[SuggestRecord], data_dir: str,
 
     md.append(f"## ⏭ Skip（確定しない） — {len(skip)} 件")
     if skip:
-        md.append("| file | det_freq(MHz) | bw(MHz) | duty | cc_class(理由) | rationale |")
-        md.append("|---|---|---|---|---|---|")
+        md.append("| file | PNG | det_freq(MHz) | bw(MHz) | duty | cc_class(理由) | rationale |")
+        md.append("|---|---|---|---|---|---|---|")
         md.extend(_row(r) for r in skip)
     else:
         md.append("(なし)")
@@ -291,8 +290,8 @@ def format_confirm_sheet(records: list[SuggestRecord], data_dir: str,
     md.append(f"## 🔎 Needs-review（視覚分類 未記入・要目視） — {len(needs)} 件")
     if needs:
         md.append("CC が cc_class を埋め忘れた行。黙って skip せず人間に必ず提示する（前回の空振り穴の再発防止）。")
-        md.append("| file | det_freq(MHz) | bw(MHz) | duty | cc_class | rationale |")
-        md.append("|---|---|---|---|---|---|")
+        md.append("| file | PNG | det_freq(MHz) | bw(MHz) | duty | cc_class | rationale |")
+        md.append("|---|---|---|---|---|---|---|")
         md.extend(_row(r) for r in needs)
     else:
         md.append("(なし) — 全件で cc_class が記入済み。")
@@ -327,6 +326,39 @@ def write_confirm_sheet(out_dir: str, records: list[SuggestRecord],
     return path
 
 
+def write_classify_tasklist(out_dir: str, records: list[SuggestRecord],
+                            data_dir: str, pattern: str) -> str:
+    """CC が視覚分類するための PNG+客観 タスクリスト（--auto-classify 用）。"""
+    os.makedirs(out_dir, exist_ok=True)
+    path = os.path.join(out_dir, "classify_tasklist.md")
+    md: list[str] = []
+    md.append(f"# 視覚分類タスクリスト（CC用） — {pattern}  {len(records)} 件")
+    md.append("")
+    md.append("CC はこの全 PNG を `view` で開き、cc_class"
+              "(ble-adv/wifi/spurious/hopping/unclear)と cc_rationale を判断して "
+              "`cc_verdicts.csv`(record,cc_class,cc_rationale) を書き、`--verdicts` 併合で"
+              "再実行する。**判断基準＝検出帯(赤帯)の主役が何か**（帯域外ブロブに引きずられない）。")
+    md.append("")
+    md.append("| # | record | PNG | det(MHz) | bw(MHz) | snr | duty | spur_warn |")
+    md.append("|---|---|---|---|---|---|---|---|")
+    for i, r in enumerate(records, 1):
+        inc = "i" if r.duty_inconclusive else ""
+        snr = "" if r.snr_db is None else f"{r.snr_db:.1f}"
+        md.append(f"| {i} | {r.record} | {r.png} | {r.det_freq_mhz:.2f} | "
+                  f"{r.bw_mhz:.2f} | {snr} | {r.duty:.3f}{inc} | "
+                  f"{'True' if r.spurious_warn else 'False'} |")
+    md.append("")
+    md.append("cc_verdicts.csv テンプレ（cc_class / cc_rationale を埋める）:")
+    md.append("```")
+    md.append("record,cc_class,cc_rationale")
+    for r in records:
+        md.append(f"{r.record},,")
+    md.append("```")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(md) + "\n")
+    return path
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -351,6 +383,10 @@ def main(argv=None) -> int:
     p.add_argument("--verdicts", default=None,
                    help="CC 視覚所見 CSV(record,cc_class,cc_rationale)。"
                         "未指定なら <out>/cc_verdicts.csv があれば併合")
+    p.add_argument("--auto-classify", action="store_true", dest="auto_classify",
+                   help="バックグラウンド視覚分類: PNG+客観の分類タスクリストを出力し、"
+                        "CC が全PNGを分類→cc_verdicts.csv→--verdicts 併合を1セッションで完遂する。"
+                        "既定オフ＝従来挙動。ツール自身は画像認識しない（分類は CC が行う）")
     args = p.parse_args(argv)
 
     records = collect_objective(args.data, pattern=args.pattern)
@@ -380,6 +416,11 @@ def main(argv=None) -> int:
               "CC が PNG を見て cc_class を埋めること（黙って skip にしない）。")
     print(f"  CSV  : {csv_path}")
     print(f"  Sheet: {sheet_path}")
+    if args.auto_classify:
+        task_path = write_classify_tasklist(args.out, records, args.data, args.pattern)
+        print(f"  Task : {task_path}")
+        print("     → CC が全 PNG を view で分類し cc_verdicts.csv を書き、"
+              "--verdicts 併合で再実行（人間の手作業を挟まず confirm_sheet まで到達）")
     return 0
 
 
