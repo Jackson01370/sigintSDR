@@ -101,7 +101,7 @@ def test_needs_review_detection_and_warning():
     sheet = rs.format_confirm_sheet(recs, "captures/", "*")
     assert "未記入 1 件" in sheet                          # 冒頭の件数付き警告
     assert "Needs-review（視覚分類 未記入・要目視） — 1 件" in sheet   # 4節目
-    assert "Confirm as BLE ch37（recommend=confirm-ble） — 1 件" in sheet
+    assert "Confirm as BLE adv（recommend=confirm-ble） — 1 件" in sheet
     assert "rec_blank" in sheet                           # 未記入行がシートに出る
 
 

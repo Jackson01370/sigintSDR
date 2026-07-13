@@ -147,7 +147,7 @@ def _make_suggest(tmp_path, rows):
     return str(caps), str(sc)
 
 
-def _run_suggest(tmp_path, rows, answers, include_human=False):
+def _run_suggest(tmp_path, rows, answers, include_human=False, pattern=None):
     caps, sc = _make_suggest(tmp_path, rows)
     prompts, printed, calls = [], [], []
     it = iter(answers)
@@ -165,7 +165,8 @@ def _run_suggest(tmp_path, rows, answers, include_human=False):
 
     review.run_suggest_review(caps, sc, input_fn=input_fn,
                               print_fn=printed.append,
-                              include_human=include_human, apply_fn=apply_fn)
+                              include_human=include_human, apply_fn=apply_fn,
+                              pattern=pattern)
     return prompts, "\n".join(printed), calls
 
 
@@ -234,7 +235,8 @@ def test_suggest_ui_confirmed_human_gated_by_include(tmp_path):
                  spurious_warn="False", _cur_method="human", _cur_conf="1.0",
                  _cur_label="BLE/Bluetooth (adv?)")]
     _, out, calls = _run_suggest(tmp_path, rows, [], include_human=False)
-    assert "確定済み(human)" in out and calls == []
+    # 新設計: 対象集合は走査+フィルタ。human は include_human=False で対象外＝提示されない。
+    assert "対象 0 件" in out and calls == []
     prompts2, out2, calls2 = _run_suggest(tmp_path, rows, ["y"], include_human=True)
     assert any("y=確定" in p for p in prompts2)
     assert calls2[0]["new_label"] == "BLE/Bluetooth (adv?)"
@@ -258,9 +260,11 @@ def test_main_dispatch_backcompat(tmp_path, monkeypatch):
         return 0
 
     def fake_suggest(dirpath, suggest_csv, input_fn=input, print_fn=print,
-                     include_human=False, apply_fn=None):
+                     include_human=False, apply_fn=None,
+                     conf_max=float("inf"), verdict=None, pattern=None):
         seen.clear()
-        seen.update(mode="suggest", csv=suggest_csv, include_human=include_human)
+        seen.update(mode="suggest", csv=suggest_csv, include_human=include_human,
+                    pattern=pattern)
         return 0
 
     monkeypatch.setattr(review, "_cmd_list", fake_cmd_list)
@@ -275,6 +279,8 @@ def test_main_dispatch_backcompat(tmp_path, monkeypatch):
     assert seen["mode"] == "review" and seen["include_human"] is True
     review.main([str(tmp_path), "--suggest", "x.csv"])        # ○×UI
     assert seen["mode"] == "suggest" and seen["csv"] == "x.csv"
+    review.main([str(tmp_path), "--suggest", "x.csv", "--pattern", "foo*"])  # #7: pattern を渡す
+    assert seen["mode"] == "suggest" and seen["pattern"] == "foo*"
     review.main([str(tmp_path), "--suggest", "x.csv", "--list"])  # --list 優先(読み取り)
     assert seen["mode"] == "list"
     review.main([str(tmp_path), "--list", "--include-human"])     # 訂正経路の列挙
@@ -308,3 +314,60 @@ def test_auto_classify_tasklist(tmp_path):
     assert "captures/_images/a.png" in txt                 # PNG パス
     assert "record,cc_class,cc_rationale" in txt           # cc_verdicts テンプレ
     assert "a,," in txt
+
+
+# ---------------------------------------------------------------------------
+# 【#7 回帰】対象集合＝走査+フィルタ（suggestions.csv は lookup 専用）
+# ---------------------------------------------------------------------------
+def test_suggest_target_scoped_by_pattern(tmp_path):
+    """--suggest + --pattern で対象が1件に絞られる（CSVの3件全部を回さない）。今回のバグの回帰。"""
+    rows = [
+        dict(record="sel_1", cc_class="ble-adv", recommend="confirm-ble", spurious_warn="False"),
+        dict(record="oth_2", cc_class="ble-adv", recommend="confirm-ble", spurious_warn="False"),
+        dict(record="oth_3", cc_class="ble-adv", recommend="confirm-ble", spurious_warn="False"),
+    ]
+    prompts, out, calls = _run_suggest(tmp_path, rows, ["s"], pattern="sel_*")
+    assert "対象 1 件" in out                       # CSVに3件あっても対象は1件
+    assert "sel_1.sigmf-meta" in out
+    assert "oth_2" not in out and "oth_3" not in out  # pattern 非一致は対象外
+    assert calls == []                               # s=skip（確定しない）
+
+
+def test_suggest_no_proposal_blocks_y(tmp_path):
+    """対象だが suggestions.csv に該当提案が無い → y を出さず強制ラベル選択（摩擦の新条件）。"""
+    caps = tmp_path / "caps"; caps.mkdir()
+    out_dir = tmp_path / "out"; out_dir.mkdir()
+    _wm(str(caps), "rec_x", method="rule", confidence=0.2)   # 対象（rule 低conf）
+    sc = out_dir / "suggestions.csv"
+    with open(sc, "w", encoding="utf-8", newline="") as f:
+        f.write("# banner\n")
+        w = csv.DictWriter(f, fieldnames=_SUGGEST_FIELDS)
+        w.writeheader()
+        r = {k: "" for k in _SUGGEST_FIELDS}
+        r.update(record="rec_other", cc_class="ble-adv", recommend="confirm-ble",
+                 spurious_warn="False")
+        w.writerow(r)                                        # CSV には別レコードだけ
+    prompts, printed, calls = [], [], []
+
+    def input_fn(p):
+        prompts.append(p)
+        return "s"
+
+    def apply_fn(*a, **k):
+        calls.append((a, k))
+
+    review.run_suggest_review(str(caps), str(sc), input_fn=input_fn,
+                              print_fn=printed.append, apply_fn=apply_fn)
+    out = "\n".join(printed)
+    assert "対象 1 件" in out                         # rec_x が対象（CSVの rec_other は無関係）
+    assert "提案なし" in out                           # 提案 lookup で該当なし
+    assert not any("y=確定" in p for p in prompts)     # y を出さない（強制ラベル選択）
+    assert calls == []                                 # s=skip（確定しない）
+
+
+def test_confirm_sheet_no_ch37_hardcode():
+    """【#9】confirm_sheet 見出しに "ch37" が含まれない（バッチ非依存の汎用表記）。"""
+    r = _suggest_record(cc_class="ble-adv", recommend="confirm-ble")
+    sheet = rs.format_confirm_sheet([r], "captures/", "2480MHz_1783755*")
+    assert "ch37" not in sheet
+    assert "BLE adv" in sheet

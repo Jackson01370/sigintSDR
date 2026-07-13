@@ -423,67 +423,96 @@ def _prompt_label(cands: list[str], input_fn, print_fn):
 
 def run_suggest_review(dirpath: str, suggest_csv: str,
                        input_fn=input, print_fn=print,
-                       include_human: bool = False, apply_fn=None) -> int:
-    """○×UI: suggestions.csv の CC 提案を y/n で確定する（摩擦=安全弁つき）。
+                       include_human: bool = False, apply_fn=None,
+                       conf_max: float = float("inf"),
+                       verdict: str | None = None,
+                       pattern: str | None = None) -> int:
+    """○×UI: CC 提案を y/n で確定する（摩擦=安全弁つき）。
+
+    **対象集合は走査＋フィルタで決める**（run_review と同一経路。suggestions.csv は
+    対象集合の決定に一切関与しない）:
+      verdict=='C' → find_c_conflict(dirpath, pattern)
+      それ以外     → find_low_confidence(dirpath, conf_max, pattern, include_human)
+    suggestions.csv は **各レコードに提案を紐付ける lookup 専用**（キー=ファイル名ベース）。
 
     y=CC提案ラベルで確定 / n=ラベル一覧から人間が選ぶ / s=スキップ / q=終了。
-    安全弁: cc_class が unclear / spurious_warn=True / needs-review(未記入) のときは
-    y を出さず、ラベル一覧を強制表示する（提案の素通り＝Pattern A 化を構造で防ぐ）。
+    安全弁（提案素通り＝Pattern A 化を構造で防ぐ）: cc_class が unclear /
+    spurious_warn=True / needs-review(未記入) / **提案なし(CSVに該当エントリなし)** の
+    ときは y を出さず、ラベル一覧を強制表示する。
     確定は apply_label（method=human, confidence=1.0, 履歴 record_history=True）。
-    include_human=False（既定）では確定済み(method=human)の行は提示せずスキップする。
     """
     apply_fn = apply_fn or apply_label
-    rows = _read_suggestions(suggest_csv)
+    # --- 対象集合＝走査＋フィルタ（既存の選別ロジックを再利用）---
+    if verdict == "C":
+        items = find_c_conflict(dirpath, pattern=pattern)
+    else:
+        items = find_low_confidence(dirpath, conf_max=conf_max, pattern=pattern,
+                                    include_human=include_human)
+    # --- suggestions.csv は提案の lookup（record 名→行）専用 ---
+    suggest = {(r.get("record") or "").strip(): r
+               for r in _read_suggestions(suggest_csv)
+               if (r.get("record") or "").strip()}
     cands = candidate_labels()
-    print_fn(f"○×UIレビュー: 提案 {len(rows)} 件（{suggest_csv}） "
-             f"include_human={include_human}")
+    scope = f"pattern={pattern!r} include_human={include_human}"
+    if verdict == "C":
+        scope += " verdict=C"
+    print_fn(f"○×UIレビュー: 対象 {len(items)} 件（{scope} / 提案元 {suggest_csv}）")
     changed = 0
-    for n, row in enumerate(rows, 1):
-        record = (row.get("record") or "").strip()
-        meta_path = os.path.join(dirpath, record + ".sigmf-meta")
-        if not record or not os.path.exists(meta_path):
-            print_fn(f"--- [{n}/{len(rows)}] {record or '(空)'}: meta 無し → スキップ")
-            continue
-        with open(meta_path) as f:
-            meta = json.load(f)
-        ann_index, ann = _first_band_ann_index(meta)
-        if ann is None:
-            print_fn(f"--- [{n}/{len(rows)}] {record}: annotation 無し → スキップ")
-            continue
-        cur_label = ann.get("core:label")
-        cur_method = ann.get("sigscan:method")
-        cur_conf = ann.get("sigscan:confidence")
-        persist = ann.get("sigscan:persistence")
-        if cur_method == "human" and not include_human:
-            print_fn(f"--- [{n}/{len(rows)}] {record}: 確定済み(human) → スキップ"
-                     "（訂正は --include-human）")
-            continue
+    for n, item in enumerate(items, 1):
+        meta_path = item["meta_path"]
+        ann_index = item["ann_index"]
+        record = os.path.basename(meta_path)
+        if record.endswith(".sigmf-meta"):
+            record = record[: -len(".sigmf-meta")]
+        cur_label = item.get("label")
+        cur_method = item.get("method") or "rule"
+        cur_conf = item.get("confidence")
+        persist = (item.get("ann") or {}).get("sigscan:persistence")
+        snr = item.get("snr_db")
 
-        cc_class = (row.get("cc_class") or "").strip()
-        cc_rationale = (row.get("cc_rationale") or "").strip()
-        spurious_warn = (row.get("spurious_warn") == "True")
-        recommend = (row.get("recommend") or "").strip()
-        proposed_label = cc_class_to_label(cc_class)
-        png = (row.get("png") or _png_path_for(meta_path) or "(なし)")
+        row = suggest.get(record)            # 提案 lookup（無ければ「提案なし」）
+        png = _png_path_for(meta_path) or "(なし)"
+        if row is not None:
+            cc_class = (row.get("cc_class") or "").strip()
+            cc_rationale = (row.get("cc_rationale") or "").strip()
+            spurious_warn = (row.get("spurious_warn") == "True")
+            recommend = (row.get("recommend") or "").strip()
+            proposed_label = cc_class_to_label(cc_class)
+            png = row.get("png") or png
+            cc_line = (f"  CC提案 : {proposed_label or '(写像なし)'}   "
+                       f"[cc_class={cc_class or '未記入'}]")
+            rationale_line = f"  根拠   : {cc_rationale or '-'}"
+            extra = (f" duty={row.get('duty', '?')}"
+                     f"{'(inconclusive)' if row.get('duty_inconclusive') == 'True' else ''}"
+                     f" spur={row.get('spurious_warn', '?')}")
+        else:
+            cc_class = ""
+            spurious_warn = False
+            recommend = ""
+            proposed_label = None
+            cc_line = "  CC提案 : (提案なし＝suggestions.csv に該当エントリなし)"
+            rationale_line = None
+            extra = ""
 
-        lines = [
-            f"--- [{n}/{len(rows)}] ---",
-            f"  file   : {os.path.basename(meta_path)}",
-            f"  PNG    : {png}",
-            f"  CC提案 : {proposed_label or '(写像なし)'}   [cc_class={cc_class or '未記入'}]",
-            f"  根拠   : {cc_rationale or '-'}",
-            f"  客観   : det={row.get('det_freq_mhz', '?')}MHz BW={row.get('bw_mhz', '?')}MHz "
-            f"SNR={row.get('snr_db', '?')}dB persist={persist if persist is not None else '?'} "
-            f"duty={row.get('duty', '?')}"
-            f"{'(inconclusive)' if row.get('duty_inconclusive') == 'True' else ''} "
-            f"spur={row.get('spurious_warn', '?')}",
-        ]
-        if cur_method == "human":
-            lines.append(f"  現在   : label='{cur_label}' "
-                         f"(confidence={cur_conf}, method={cur_method})  ← 訂正対象")
+        lines = [f"--- [{n}/{len(items)}] ---",
+                 f"  file   : {record}.sigmf-meta",
+                 f"  PNG    : {png}", cc_line]
+        if rationale_line:
+            lines.append(rationale_line)
+        lines.append(f"  客観   : tuner={item['center']/1e6:.3f}MHz "
+                     f"det_bw={item['bw']/1e6:.2f}MHz "
+                     f"SNR={snr if snr is not None else '?'}dB "
+                     f"persist={persist if persist is not None else '?'}{extra}")
+        lines.append(f"  現在   : label='{cur_label}' "
+                     f"(confidence={cur_conf}, method={cur_method})"
+                     + ("  ← 訂正対象" if cur_method == "human" else ""))
         print_fn("\n".join(lines))
 
-        reason = _y_blocked_reason(cc_class, spurious_warn, recommend)
+        # 摩擦: 提案なし → y 不可。提案あり → 既存の y ブロック条件。
+        if row is None:
+            reason = "提案なし（suggestions.csv に該当エントリなし）"
+        else:
+            reason = _y_blocked_reason(cc_class, spurious_warn, recommend)
         if reason == "":
             try:
                 ans = input_fn("  この提案で確定してよいか？ "
@@ -601,8 +630,9 @@ def main(argv=None) -> int:
     if args.list:                       # --list は読み取りのみ（--suggest 併用でも列挙）
         return _cmd_list(args.dir, conf_max, verdict=args.verdict,
                          pattern=args.pattern, **ih)
-    if args.suggest is not None:        # ○×UI（対話確定）
-        return run_suggest_review(args.dir, args.suggest, **ih)
+    if args.suggest is not None:        # ○×UI（対話確定）: 対象は走査+フィルタ・CSVは提案lookup
+        return run_suggest_review(args.dir, args.suggest, conf_max=conf_max,
+                                  verdict=args.verdict, pattern=args.pattern, **ih)
     return run_review(args.dir, conf_max=conf_max, verdict=args.verdict,
                       pattern=args.pattern, **ih)
 

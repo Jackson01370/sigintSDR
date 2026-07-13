@@ -250,7 +250,7 @@ def format_confirm_sheet(records: list[SuggestRecord], data_dir: str,
     warns = [r for r in records if r.spurious_warn]
 
     md: list[str] = []
-    md.append(f"# 確定シート: BLE ch37 レビュー提案（サンドボックス） — {pattern}")
+    md.append(f"# 確定シート: BLE adv レビュー提案（サンドボックス） — {pattern}")
     md.append("")
     md.append("> **正直バナー（提案 ≠ 確定）**  ")
     for b in BANNER:
@@ -269,7 +269,7 @@ def format_confirm_sheet(records: list[SuggestRecord], data_dir: str,
               "確認してから確定（yes）。skip は確定しない。**承認判断は人間が握る（提案の鵜呑み禁止）**。")
     md.append("")
 
-    md.append(f"## ✅ Confirm as BLE ch37（recommend=confirm-ble） — {len(confirm)} 件")
+    md.append(f"## ✅ Confirm as BLE adv（recommend=confirm-ble） — {len(confirm)} 件")
     if confirm:
         md.append("| file | PNG | det_freq(MHz) | bw(MHz) | duty | cc_class | rationale |")
         md.append("|---|---|---|---|---|---|---|")
