@@ -42,7 +42,8 @@ def dwell_tune_offset(bw_hz, offset_hz: float, max_bw_hz: float) -> float:
 class HybridScheduler:
     def __init__(self, backend: SDRBackend, cfg: Config, store: Store | None = None,
                  collect_dir: str | None = None, collect_snr_min: float = 8.0,
-                 collect_dedup_s: float = 30.0, dwell_mode: bool = False):
+                 collect_dedup_s: float = 30.0, dwell_mode: bool = False,
+                 max_records: int = 0, max_minutes: float = 0.0, time_fn=None):
         self.be = backend
         self.cfg = cfg
         self.store = store
@@ -57,6 +58,18 @@ class HybridScheduler:
         self._recent_collect: list[dict] = []   # 直近に収集した {center, bw, t}
         self._collected = 0
         self._skipped_dup = 0
+        # 収集の自動停止（既定 0=無制限＝従来と完全に同一挙動。0/未設定なら
+        # _limit_hit は常に None を返し、run の巡回は Ctrl+C まで止まらない）。
+        #   max_records: 実際に SAVE した件数(self._collected)の上限。
+        #   max_minutes: run 開始からの経過分の上限（float 可）。両指定は OR＝先に達した方。
+        #   判定は「1レコード保存が完了した直後（data/meta が対で完成した安全な区切り）」
+        #   または「巡回の区切り」でのみ行う（半端なファイルを作らない）。
+        #   time_fn は経過時間の時刻源（テストで差し替えて決定的にするための継ぎ目）。
+        self._max_records = int(max_records or 0)
+        self._max_minutes = float(max_minutes or 0.0)
+        self._time_fn = time_fn or time.time
+        self._run_start: float | None = None
+        self._stop_reason: str | None = None
         # データ出所を正直に記録（合成と実測を後で混ぜないため）
         self._hw = ("HackRF One" if type(backend).__name__ == "HackRFBackend"
                     else "sigscan-sim (synthetic)")
@@ -360,6 +373,11 @@ class HybridScheduler:
 
             outcomes.append(dict(obs=obs, m=m, result=result,
                                  verdict=verdict, saved=saved))
+            # 自動停止（保存直後の安全な区切り）: 上限到達なら残りの対象を打ち切る。
+            # _save_dwell は write_recording＋品質メタ patch を終えてから _collected を
+            # 増やすので、この地点では data/meta が対で完成している（半端なファイルなし）。
+            if self._limit_hit():
+                break
         return outcomes
 
     def _print_dwell(self, o: dict) -> None:
@@ -380,9 +398,28 @@ class HybridScheduler:
               f"persist={obs.persistence:4.2f}({obs.n_detect}/{obs.n_obs})  "
               f"→ {r.label}  [{tag}]")
 
+    def _limit_hit(self) -> str | None:
+        """収集の自動停止条件に達したら理由文字列を返す（未到達/無制限なら None）。
+
+        既定（max_records=0 かつ max_minutes=0）では常に None を返すので、呼び出し側の
+        分岐は完全な no-op になり、従来挙動（Ctrl+C まで無限巡回）と一致する。
+        - max_records: 実際に SAVE した件数 self._collected で判定。
+        - max_minutes: run 開始 self._run_start からの経過分で判定（run 外なら時間判定は無効）。
+        両方指定は OR（先に達した方）。この判定は「1レコード保存直後」または「巡回の
+        区切り」でのみ呼ぶ約束（半端なファイルを作らない安全な地点）。
+        """
+        if self._max_records and self._collected >= self._max_records:
+            return "max-records"
+        if self._max_minutes and self._run_start is not None:
+            if (self._time_fn() - self._run_start) / 60.0 >= self._max_minutes:
+                return "max-minutes"
+        return None
+
     # --- メインループ ---
     def run(self, once: bool = False, verbose: bool = True):
         sc = self.cfg.scan
+        self._run_start = self._time_fn()      # 経過時間(max_minutes)の基準時刻
+        self._stop_reason = None
         try:
             while True:
                 if time.time() - self._last_survey >= sc.survey_interval_s:
@@ -408,10 +445,21 @@ class HybridScheduler:
                                   f"BW={m['bw_hz']/1e6:5.1f}MHz  "
                                   f"SNR={m['snr_db']:4.0f}dB  "
                                   f"→ {r.label} ({r.confidence:.2f}/{r.method})")
+                        # 自動停止（1レコード保存が完了した直後の安全な区切り）:
+                        # dwell は保存後に self._collected を増やすので data/meta は対で完成。
+                        if self._limit_hit():
+                            break
 
-                if once:
+                # 巡回の区切りでも判定（保存が無くても時間上限だけで止まれる）。
+                self._stop_reason = self._limit_hit()
+                if self._stop_reason or once:
                     break
                 time.sleep(0.2)
         except KeyboardInterrupt:
             if verbose:
                 print("\n停止しました。")
+        # 自動停止時のみサマリを出す（既定=無制限では _stop_reason は None のまま＝無出力）。
+        if self._stop_reason and verbose:
+            elapsed_min = (self._time_fn() - self._run_start) / 60.0
+            print(f"[stop] {self._stop_reason} 到達: "
+                  f"収集 {self._collected} 件 / 経過 {elapsed_min:.1f} 分")

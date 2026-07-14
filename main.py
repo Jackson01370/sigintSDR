@@ -68,6 +68,14 @@ def main():
                    help="収集するSNR下限dB(既定8)")
     p.add_argument("--collect-dedup-window", type=float, default=30.0,
                    metavar="SEC", help="収集側の近接重複排除の時間窓(秒, 既定30, 0で無効)")
+    p.add_argument("--max-records", type=int, default=0, dest="max_records",
+                   metavar="N",
+                   help="収集の自動停止: N件SAVEしたら終了(既定0=無制限)。"
+                        "1レコード保存直後に判定")
+    p.add_argument("--max-minutes", type=float, default=0.0, dest="max_minutes",
+                   metavar="M",
+                   help="収集の自動停止: M分経過したら終了(既定0=無制限, float可)。"
+                        "両指定は先に達した方で終了")
     p.add_argument("--db", default="sigscan.db", help="SQLiteログのパス")
 
     # --- 滞在観測モード（dwell 観測の長時間化）---
@@ -199,7 +207,9 @@ def main():
                             collect_dir=args.collect,
                             collect_snr_min=args.collect_snr,
                             collect_dedup_s=args.collect_dedup_window,
-                            dwell_mode=dwell_mode)
+                            dwell_mode=dwell_mode,
+                            max_records=args.max_records,
+                            max_minutes=args.max_minutes)
     if dwell_mode:
         gate = "無効" if not cfg.quality.enabled else "厳しめ"
         print(f"滞在観測モード: 各対象に {cfg.dwell.dwell_seconds:g}s 滞在 / "
