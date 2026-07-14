@@ -53,7 +53,9 @@ def _ann(path):
 def test_cc_class_to_label():
     assert review.cc_class_to_label("ble-adv") == "BLE/Bluetooth (adv?)"
     assert review.cc_class_to_label("wifi") == "WiFi (2.4GHz, 20/40MHz)"
-    for none_case in ("hopping", "spurious", "unclear", "", None):
+    # 確定UI高速化: spurious も写像を持つ（y 許可は方向性ガードが別途制御）。
+    assert review.cc_class_to_label("spurious") == review.SPURIOUS
+    for none_case in ("hopping", "unclear", "", None):
         assert review.cc_class_to_label(none_case) is None, none_case
 
 
@@ -147,7 +149,8 @@ def _make_suggest(tmp_path, rows):
     return str(caps), str(sc)
 
 
-def _run_suggest(tmp_path, rows, answers, include_human=False, pattern=None):
+def _run_suggest(tmp_path, rows, answers, include_human=False, pattern=None,
+                 batch_confirm=False):
     caps, sc = _make_suggest(tmp_path, rows)
     prompts, printed, calls = [], [], []
     it = iter(answers)
@@ -166,7 +169,7 @@ def _run_suggest(tmp_path, rows, answers, include_human=False, pattern=None):
     review.run_suggest_review(caps, sc, input_fn=input_fn,
                               print_fn=printed.append,
                               include_human=include_human, apply_fn=apply_fn,
-                              pattern=pattern)
+                              pattern=pattern, batch_confirm=batch_confirm)
     return prompts, "\n".join(printed), calls
 
 
@@ -218,14 +221,134 @@ def test_suggest_ui_needs_review_blocks_y(tmp_path):
     assert calls == []
 
 
-def test_suggest_ui_n_shows_label_list(tmp_path):
-    """y 可のケースでも n を押せばラベル一覧が出て人間が選ぶ（従来の選択）。"""
+# ---------------------------------------------------------------------------
+# (6) 確定UI高速化: ガードの方向性化 / 一覧抑制 / --batch-confirm
+# ---------------------------------------------------------------------------
+def test_y_blocked_reason_directional():
+    """_y_blocked_reason の方向性: warn+spurious=許可 / warn+非spurious=ブロック。
+
+    ''＝y 許可（既存コードの規約。指示書の擬似コードの None に対応）。
+    """
+    B = review._y_blocked_reason
+    # 1. warn + spurious → 許可（正しい方向）
+    assert B("spurious", True, "skip") == ""
+    # 2-3. warn + 非spurious(ble-adv/wifi) → ブロック（危険な方向）
+    assert B("ble-adv", True, "skip") != ""
+    assert B("wifi", True, "skip") != ""
+    # 4-5. warn + unclear / 未記入 → ブロック（不変）
+    assert B("unclear", True, "skip") != ""
+    assert B("", True, "needs-review") != ""
+    # 6. warn無し + unclear → ブロック（既存の摩擦・不変）
+    assert B("unclear", False, "skip") != ""
+    # 7. warn無し + ble-adv → 許可（既存・不変）
+    assert B("ble-adv", False, "confirm-ble") == ""
+
+
+def test_suggest_ui_spurious_warn_offers_y_and_confirms(tmp_path):
+    """最重要: warn + cc_class=spurious は y 許可 → 提案どおり SPURIOUS で確定できる。"""
+    rows = [dict(record="sp", cc_class="spurious", recommend="skip",
+                 spurious_warn="True", det_freq_mhz="2440.00", bw_mhz="0.23",
+                 png="captures/_images/sp.png")]
+    prompts, out, calls = _run_suggest(tmp_path, rows, ["y"])
+    assert any("y=確定" in p for p in prompts)                # y が提示される（従来は出なかった）
+    assert len(calls) == 1
+    assert calls[0]["new_label"] == review.SPURIOUS           # 提案どおり spurious 確定
+    assert calls[0]["kw"].get("record_history") is True
+
+
+def test_suggest_ui_warn_ble_still_blocks_y(tmp_path):
+    """warn + 非spurious提案(ble-adv) は従来どおり y ブロック（危険な方向を止める）。"""
+    rows = [dict(record="wb", cc_class="ble-adv", recommend="skip",
+                 spurious_warn="True")]
+    prompts, out, calls = _run_suggest(tmp_path, rows, ["s"])
+    assert not any("y=確定" in p for p in prompts)
+    assert "スプリアス警告" in out and "危険な方向" in out
+    assert calls == []
+
+
+def test_suggest_ui_default_hides_full_list(tmp_path):
+    """一覧抑制: 通常プロンプトに48行の一覧が出ない（ショートカット行のみ）。"""
     rows = [dict(record="a", cc_class="ble-adv", recommend="confirm-ble",
                  spurious_warn="False")]
-    prompts, out, calls = _run_suggest(tmp_path, rows, ["n", "0"])
-    assert any("y=確定" in p for p in prompts)              # 最初に y/n は出た
-    assert "候補ラベル" in out
-    assert len(calls) == 1                                   # 人間選択で確定
+    prompts, out, calls = _run_suggest(tmp_path, rows, ["s"])
+    assert "候補ラベル" not in out                            # 48行一覧は出ない
+    # ショートカット行は出ている（実際の候補番号がラベル表から引かれている）。
+    idx = review.candidate_labels().index(review.SPURIOUS)
+    assert any(f"{idx}=spurious" in p for p in prompts)
+
+
+# --- --batch-confirm（一括確定） ---
+def _batch_rows():
+    """一括候補3件(spurious warn / ble-adv / wifi) ＋ 個別2件(unclear / warn+ble)。"""
+    return [
+        dict(record="sp1", cc_class="spurious", recommend="skip",
+             spurious_warn="True", det_freq_mhz="2440.0", bw_mhz="0.23"),
+        dict(record="bl1", cc_class="ble-adv", recommend="confirm-ble",
+             spurious_warn="False"),
+        dict(record="wf1", cc_class="wifi", recommend="skip",
+             spurious_warn="False"),
+        dict(record="uc1", cc_class="unclear", recommend="skip",
+             spurious_warn="False"),
+        dict(record="wb1", cc_class="ble-adv", recommend="skip",
+             spurious_warn="True"),
+    ]
+
+
+def test_batch_confirm_partitions_clear_from_ambiguous(tmp_path):
+    """仕分け: y 可(spurious warn/ble/wifi)=一括候補、unclear/warn+ble=個別確認へ。"""
+    prompts, out, calls = _run_suggest(tmp_path, _batch_rows(), ["n"],
+                                       batch_confirm=True)
+    assert "一括確定候補（CC提案どおり y 可）: 3 件" in out    # 3件が一括候補
+    for rec in ("sp1", "bl1", "wf1"):
+        assert rec in out
+    assert calls == []                                        # n で中止＝何も確定しない
+
+
+def test_batch_confirm_y_confirms_all_then_individual(tmp_path):
+    """一括確定(y)後、個別グループ(unclear/warn+ble)が1件ずつ回る（黙って捨てない）。"""
+    # answers: 一括プロンプト=y, その後 個別2件を s, s
+    prompts, out, calls = _run_suggest(tmp_path, _batch_rows(), ["y", "s", "s"],
+                                       batch_confirm=True)
+    # 一括で3件確定（apply_fn が3回）。
+    batch_recs = sorted(c["record"] for c in calls)
+    assert batch_recs == ["bl1.sigmf-meta", "sp1.sigmf-meta", "wf1.sigmf-meta"]
+    assert all(c["kw"].get("record_history") is True for c in calls)
+    # 個別グループが提示された（捨てられていない）。
+    assert "個別確認: 2 件" in out
+
+
+def test_batch_confirm_i_reviews_all_individually(tmp_path):
+    """i を選ぶと一括候補も含め全件1件ずつ回る（全部 s でスキップ）。"""
+    prompts, out, calls = _run_suggest(tmp_path, _batch_rows(),
+                                       ["i", "s", "s", "s", "s", "s"],
+                                       batch_confirm=True)
+    assert "個別確認: 5 件" in out                            # 一括候補も個別へ
+    assert calls == []                                        # 全 s＝確定なし
+
+
+def test_batch_confirm_n_aborts(tmp_path):
+    """n で中止＝一括も個別も何も確定しない。"""
+    _, out, calls = _run_suggest(tmp_path, _batch_rows(), ["n"], batch_confirm=True)
+    assert "中止しました" in out
+    assert calls == []
+
+
+def test_batch_confirm_off_is_per_record(tmp_path):
+    """後方互換: --batch-confirm 未指定なら一括プロンプトを出さず1件ずつ。"""
+    _, out, calls = _run_suggest(tmp_path, _batch_rows(), ["q"])   # 1件目で q
+    assert "一括確定候補" not in out                          # 一括プロンプトなし
+    assert "個別確認" not in out or "一括" not in out
+
+
+def test_suggest_ui_qmark_shows_label_list(tmp_path):
+    """一覧は既定非表示。? を押すと48行一覧が出て、番号で人間が選ぶ（旧 n 二段の後継）。"""
+    rows = [dict(record="a", cc_class="ble-adv", recommend="confirm-ble",
+                 spurious_warn="False")]
+    prompts, out, calls = _run_suggest(tmp_path, rows, ["?", "0"])
+    assert any("y=確定" in p for p in prompts)              # y は提示されている
+    assert "候補ラベル" in out                              # ? で全一覧が展開された
+    assert len(calls) == 1                                   # 番号選択で確定
+    assert calls[0]["new_label"] == review.candidate_labels()[0]
     assert calls[0]["kw"].get("record_history") is True
 
 
@@ -261,10 +384,11 @@ def test_main_dispatch_backcompat(tmp_path, monkeypatch):
 
     def fake_suggest(dirpath, suggest_csv, input_fn=input, print_fn=print,
                      include_human=False, apply_fn=None,
-                     conf_max=float("inf"), verdict=None, pattern=None):
+                     conf_max=float("inf"), verdict=None, pattern=None,
+                     batch_confirm=False):
         seen.clear()
         seen.update(mode="suggest", csv=suggest_csv, include_human=include_human,
-                    pattern=pattern)
+                    pattern=pattern, batch_confirm=batch_confirm)
         return 0
 
     monkeypatch.setattr(review, "_cmd_list", fake_cmd_list)
@@ -279,6 +403,9 @@ def test_main_dispatch_backcompat(tmp_path, monkeypatch):
     assert seen["mode"] == "review" and seen["include_human"] is True
     review.main([str(tmp_path), "--suggest", "x.csv"])        # ○×UI
     assert seen["mode"] == "suggest" and seen["csv"] == "x.csv"
+    assert seen["batch_confirm"] is False                     # 既定オフ（従来どおり）
+    review.main([str(tmp_path), "--suggest", "x.csv", "--batch-confirm"])  # 一括確定を渡す
+    assert seen["mode"] == "suggest" and seen["batch_confirm"] is True
     review.main([str(tmp_path), "--suggest", "x.csv", "--pattern", "foo*"])  # #7: pattern を渡す
     assert seen["mode"] == "suggest" and seen["pattern"] == "foo*"
     review.main([str(tmp_path), "--suggest", "x.csv", "--list"])  # --list 優先(読み取り)

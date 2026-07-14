@@ -52,6 +52,11 @@ SIGNAL_DB: list[tuple] = [
 # ノイズ/未確定の統一ラベル（CNN/LLM が DB 外を返したときの吸収先）
 UNKNOWN = "未識別信号"
 NOISE = "ノイズ/フロア変動"
+# HackRF 内部スプリアス（40MHzクロック高調波 2400/2440/2480・16MHzコム・2420線 等）の
+# 統一ラベル。review.py の人手確定でのみ使う語彙で、rule_based/CNN のルーティングには
+# 一切関与しない（定数の追加だけ＝classify の挙動は不変）。unknown とは別クラス（用途
+# ベース専門家CNN の spurious クラス相当）として human確定できるようにするための受け皿。
+SPURIOUS = "スプリアス(HackRF内部)"
 
 
 def _match_band(center_hz: float, bands: list[Band]) -> Band | None:

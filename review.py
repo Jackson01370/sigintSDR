@@ -23,7 +23,7 @@ import os
 import sys
 
 from config import BAND_PLAN
-from classify import SIGNAL_DB, UNKNOWN, NOISE
+from classify import SIGNAL_DB, UNKNOWN, NOISE, SPURIOUS
 
 REVIEW_METHOD = "human"
 
@@ -31,11 +31,14 @@ REVIEW_METHOD = "human"
 # global の sigscan:cnn_verdict に格納される（cnntrain M3 が書き込む）。
 C_CONFLICT = "C-conflict"
 
-# cc_class(視覚分類) → 確定ラベル文字列の写像（1箇所に定義）。hopping/spurious/
-# unclear は写像なし＝○×UI で y(提案確定)を出せない（ラベル選択を強制）。
+# cc_class(視覚分類) → 確定ラベル文字列の写像（1箇所に定義）。hopping/unclear は
+# 写像なし＝○×UI で y(提案確定)を出せない（ラベル選択を強制）。spurious は写像あり
+# だが、y 許可は「スプリアス警告つきレコードを spurious として確定する＝正しい方向」
+# のときだけ（_y_blocked_reason の方向性ガードで制御）。
 CC_CLASS_TO_LABEL = {
     "ble-adv": "BLE/Bluetooth (adv?)",
     "wifi": "WiFi (2.4GHz, 20/40MHz)",
+    "spurious": SPURIOUS,
 }
 
 
@@ -65,7 +68,7 @@ def candidate_labels() -> list[str]:
         labels.append(entry[2])
     for b in BAND_PLAN:
         labels.append(b.name)
-    labels += [UNKNOWN, NOISE]
+    labels += [SPURIOUS, UNKNOWN, NOISE]
     # 重複を順序保持で除去
     seen: set[str] = set()
     uniq: list[str] = []
@@ -386,39 +389,225 @@ def _y_blocked_reason(cc_class: str | None, spurious_warn: bool,
                       recommend: str | None) -> str:
     """○×UIで y(提案確定)を出してよいか。出せない理由文字列を返す（''＝y提示可）。
 
-    安全弁（Pattern A 化＝AI出力が素通りで ground truth 化するのを防ぐ）: 次のいずれ
-    かなら y を出さず、ラベル一覧を強制表示する:
-      - spurious_warn==True / cc_class 未記入(needs-review) / cc_class=='unclear'
-      - cc_class に確定ラベル写像が無い（hopping/spurious 等）
+    安全弁（Pattern A 化＝AI出力が素通りで ground truth 化するのを防ぐ）。スプリアス
+    ガードは「方向性」を持つ（無効化ではない）:
+      - spurious_warn かつ cc_class!='spurious' → 危険な方向（スプリアス疑いを実信号
+        として確定しようとしている）＝ブロック
+      - spurious_warn かつ cc_class=='spurious' → 正しい方向（提案どおり spurious と
+        して確定）＝許可
+    次は不変でブロック（今回の高速化でも一切緩めない）:
+      - cc_class 未記入(needs-review) / cc_class=='unclear' / 確定ラベル写像なし
     """
-    if spurious_warn:
-        return "スプリアス警告(spurious_warn=True)"
     if recommend == "needs-review" or not (cc_class or "").strip():
         return "視覚分類 未記入(needs-review)"
     if cc_class == "unclear":
         return "CCが unclear と判定"
+    if spurious_warn and cc_class != "spurious":
+        return ("スプリアス警告 + 非spurious提案（危険な方向: "
+                "スプリアス疑いのレコードを実信号として確定しようとしている）")
     if cc_class_to_label(cc_class) is None:
         return f"cc_class='{cc_class}' はラベル写像なし"
     return ""
 
 
-def _prompt_label(cands: list[str], input_fn, print_fn):
-    """ラベル一覧を出して選ばせる。returns (kind, label): kind∈{'label','skip','quit'}。"""
+def _shortcut_labels(cands: list[str]) -> list[tuple[int, str]]:
+    """ショートカットに出す (番号, 表示名) を候補表から動的に引く（番号ハードコード禁止）。"""
+    out: list[tuple[int, str]] = []
+    for label, name in ((SPURIOUS, "spurious"),
+                        (CC_CLASS_TO_LABEL["ble-adv"], "BLE"),
+                        (CC_CLASS_TO_LABEL["wifi"], "WiFi")):
+        if label in cands:
+            out.append((cands.index(label), name))
+    return out
+
+
+def _confirm_prompt_line(cands: list[str], allow_y: bool) -> str:
+    """1行のショートカットプロンプト。48行の一覧は既定で出さない（? で展開）。
+
+    y は許可時のみ表示（摩擦条件に該当すれば出さない）。頻出ラベルの番号は
+    _shortcut_labels で実際の候補番号を引く（表示番号＝入力番号が必ず一致）。
+    """
+    parts = (["y=確定"] if allow_y else [])
+    parts += [f"{i}={name}" for i, name in _shortcut_labels(cands)]
+    parts += ["s=スキップ", "?=全ラベル一覧", "q=終了"]
+    return "[" + " / ".join(parts) + "]"
+
+
+def _print_full_list(cands: list[str], print_fn) -> None:
+    """従来の48行ラベル一覧（? を押したときだけ出す）。"""
     print_fn("\n候補ラベル:")
     for i, c in enumerate(cands):
         print_fn(f"  [{i:2d}] {c}")
+
+
+def _prompt_confirm(cands: list[str], allow_y: bool, proposed_label,
+                    input_fn, print_fn):
+    """1レコードの確定プロンプト（一覧は既定非表示・? で展開）。
+
+    returns (kind, label): kind ∈ {'confirm','label','skip','quit'}
+      - y(許可時のみ) → ('confirm', proposed_label)
+      - 番号 → その候補 / 自由入力 → 任意ラベル（従来どおり）
+      - s・空 → skip / q → quit / ? → 全一覧を印字して再プロンプト
+    """
+    while True:
+        line = _confirm_prompt_line(cands, allow_y)
+        try:
+            ans = input_fn(f"  {line} > ")
+        except EOFError:
+            return ("quit", None)
+        raw = (ans or "").strip()
+        low = raw.lower()
+        if low == "q":
+            return ("quit", None)
+        if raw == "" or low == "s":
+            return ("skip", None)
+        if raw == "?":
+            _print_full_list(cands, print_fn)
+            continue
+        if low == "y":
+            if allow_y:
+                return ("confirm", proposed_label)
+            print_fn("  ⚠ このレコードは y 不可（摩擦）。"
+                     "番号/自由入力でラベルを選ぶか s/? を使ってください。")
+            continue
+        if raw.isdigit() and 0 <= int(raw) < len(cands):
+            return ("label", cands[int(raw)])
+        return ("label", raw)   # 自由入力ラベル（従来どおり）
+
+
+def _build_suggest_ctx(item: dict, suggest: dict) -> dict:
+    """1レコードの表示・判定コンテキストを組む（個別確認・一括確定で共用）。
+
+    reason/allow_y（摩擦の方向性ガードの結果）まで確定させる。表示に必要な
+    生値（center/bw/snr/persist/現在ラベル）と提案（cc_class/proposed_label/
+    det/bw/duty/根拠）を1つの dict にまとめる。
+    """
+    meta_path = item["meta_path"]
+    record = os.path.basename(meta_path)
+    if record.endswith(".sigmf-meta"):
+        record = record[: -len(".sigmf-meta")]
+    png = _png_path_for(meta_path) or "(なし)"
+    row = suggest.get(record)                # 提案 lookup（無ければ「提案なし」）
+    if row is not None:
+        cc_class = (row.get("cc_class") or "").strip()
+        cc_rationale = (row.get("cc_rationale") or "").strip()
+        spurious_warn = (row.get("spurious_warn") == "True")
+        recommend = (row.get("recommend") or "").strip()
+        proposed_label = cc_class_to_label(cc_class)
+        png = row.get("png") or png
+        det = row.get("det_freq_mhz", "?")
+        bw_sug = row.get("bw_mhz", "?")
+        duty = (f"{row.get('duty', '?')}"
+                f"{'(inconclusive)' if row.get('duty_inconclusive') == 'True' else ''}")
+        reason = _y_blocked_reason(cc_class, spurious_warn, recommend)
+    else:
+        cc_class = cc_rationale = recommend = ""
+        spurious_warn = False
+        proposed_label = None
+        det = bw_sug = duty = "?"
+        reason = "提案なし（suggestions.csv に該当エントリなし）"
+    return dict(
+        meta_path=meta_path, ann_index=item["ann_index"], record=record,
+        cur_label=item.get("label"), cur_method=item.get("method") or "rule",
+        cur_conf=item.get("confidence"),
+        center=item.get("center"), bw_item=item.get("bw"),
+        snr=item.get("snr_db"),
+        persist=(item.get("ann") or {}).get("sigscan:persistence"),
+        png=png, has_suggestion=(row is not None),
+        cc_class=cc_class, cc_rationale=cc_rationale,
+        spurious_warn=spurious_warn, recommend=recommend,
+        proposed_label=proposed_label, det=det, bw_sug=bw_sug, duty=duty,
+        reason=reason, allow_y=(reason == ""),
+    )
+
+
+def _print_suggest_header(ctx: dict, n: int, total: int, print_fn) -> None:
+    """個別確認の1レコード見出し（従来の表示を踏襲）。"""
+    if ctx["has_suggestion"]:
+        cc_line = (f"  CC提案 : {ctx['proposed_label'] or '(写像なし)'}   "
+                   f"[cc_class={ctx['cc_class'] or '未記入'}]")
+        rationale_line = f"  根拠   : {ctx['cc_rationale'] or '-'}"
+        extra = f" duty={ctx['duty']} spur={ctx['spurious_warn']}"
+    else:
+        cc_line = "  CC提案 : (提案なし＝suggestions.csv に該当エントリなし)"
+        rationale_line = None
+        extra = ""
+    snr, persist = ctx["snr"], ctx["persist"]
+    lines = [f"--- [{n}/{total}] ---",
+             f"  file   : {ctx['record']}.sigmf-meta",
+             f"  PNG    : {ctx['png']}", cc_line]
+    if rationale_line:
+        lines.append(rationale_line)
+    lines.append(f"  客観   : tuner={ctx['center']/1e6:.3f}MHz "
+                 f"det_bw={ctx['bw_item']/1e6:.2f}MHz "
+                 f"SNR={snr if snr is not None else '?'}dB "
+                 f"persist={persist if persist is not None else '?'}{extra}")
+    lines.append(f"  現在   : label='{ctx['cur_label']}' "
+                 f"(confidence={ctx['cur_conf']}, method={ctx['cur_method']})"
+                 + ("  ← 訂正対象" if ctx['cur_method'] == "human" else ""))
+    print_fn("\n".join(lines))
+
+
+def _review_one(ctx: dict, cands: list[str], n: int, total: int,
+                input_fn, print_fn, apply_fn) -> str:
+    """1レコードを個別確認して確定/スキップ/終了する。returns 'changed'|'skip'|'quit'。"""
+    _print_suggest_header(ctx, n, total, print_fn)
+    if not ctx["allow_y"]:
+        print_fn(f"  ⚠ {ctx['reason']} → 提案確定(y)は不可。"
+                 "ラベルを選択してください（skip 可）")
+    kind, new_label = _prompt_confirm(cands, ctx["allow_y"],
+                                      ctx["proposed_label"], input_fn, print_fn)
+    if kind == "quit":
+        print_fn("レビューを終了します。")
+        return "quit"
+    if kind == "skip":
+        print_fn("  → スキップ")
+        return "skip"
+    if kind == "confirm":
+        apply_fn(ctx["meta_path"], ctx["ann_index"], ctx["proposed_label"],
+                 record_history=True)
+        print_fn(f"  → 確定: '{ctx['cur_label']}' → '{ctx['proposed_label']}' "
+                 f"(method=human, cc_class={ctx['cc_class']})")
+        return "changed"
+    apply_fn(ctx["meta_path"], ctx["ann_index"], new_label, record_history=True)
+    print_fn(f"  → 確定: '{ctx['cur_label']}' → '{new_label}' (method=human)")
+    return "changed"
+
+
+def _batch_confirm(batch: list[dict], input_fn, print_fn, apply_fn):
+    """一括候補（y 許可の明快な提案）を一覧表示し y/i/n を受ける。
+
+    returns (result, n_confirmed): result ∈ {'confirm','individual','abort'}。
+      confirm → 一覧を CC提案どおり一括確定した / individual → 1件ずつ回す /
+      abort → 何も確定しない。**迷うものは一切ここに来ない**（呼び出し側で仕分け済み）。
+    """
+    if not batch:
+        print_fn("\n一括確定候補: 0 件（全件が個別確認へ）")
+        return ("individual", 0)
+    print_fn(f"\n=== 一括確定候補（CC提案どおり y 可）: {len(batch)} 件 ===")
+    for i, c in enumerate(batch, 1):
+        print_fn(f"  [{i}] {c['record']}  cc={c['cc_class']} → {c['proposed_label']}  "
+                 f"det={c['det']}MHz bw={c['bw_sug']}MHz duty={c['duty']}")
+        print_fn(f"       PNG={c['png']}  根拠: {c['cc_rationale'] or '-'}")
     try:
-        ans = input_fn("  正しい label を入力（番号/自由入力 / s=スキップ / q=終了）> ")
+        ans = input_fn(f"\n上記 {len(batch)} 件を CC提案どおり確定しますか？ "
+                       "[y=一括確定 / i=1件ずつ個別確認 / n=中止] > ")
     except EOFError:
-        return ("quit", None)
-    ans = (ans or "").strip()
-    if ans.lower() == "q":
-        return ("quit", None)
-    if ans == "" or ans.lower() == "s":
-        return ("skip", None)
-    if ans.isdigit() and 0 <= int(ans) < len(cands):
-        return ("label", cands[int(ans)])
-    return ("label", ans)
+        return ("abort", 0)
+    ans = (ans or "").strip().lower()
+    if ans == "y":
+        counts: dict[str, int] = {}
+        for c in batch:
+            apply_fn(c["meta_path"], c["ann_index"], c["proposed_label"],
+                     record_history=True)
+            counts[c["proposed_label"]] = counts.get(c["proposed_label"], 0) + 1
+        print_fn(f"  → 一括確定 {len(batch)} 件（method=human）")
+        for label, k in sorted(counts.items()):
+            print_fn(f"     {label}: {k} 件")
+        return ("confirm", len(batch))
+    if ans == "i":
+        return ("individual", 0)
+    return ("abort", 0)
 
 
 def run_suggest_review(dirpath: str, suggest_csv: str,
@@ -426,8 +615,9 @@ def run_suggest_review(dirpath: str, suggest_csv: str,
                        include_human: bool = False, apply_fn=None,
                        conf_max: float = float("inf"),
                        verdict: str | None = None,
-                       pattern: str | None = None) -> int:
-    """○×UI: CC 提案を y/n で確定する（摩擦=安全弁つき）。
+                       pattern: str | None = None,
+                       batch_confirm: bool = False) -> int:
+    """○×UI: CC 提案を確定する（摩擦=安全弁つき・一覧は既定非表示・? で展開）。
 
     **対象集合は走査＋フィルタで決める**（run_review と同一経路。suggestions.csv は
     対象集合の決定に一切関与しない）:
@@ -435,10 +625,12 @@ def run_suggest_review(dirpath: str, suggest_csv: str,
       それ以外     → find_low_confidence(dirpath, conf_max, pattern, include_human)
     suggestions.csv は **各レコードに提案を紐付ける lookup 専用**（キー=ファイル名ベース）。
 
-    y=CC提案ラベルで確定 / n=ラベル一覧から人間が選ぶ / s=スキップ / q=終了。
-    安全弁（提案素通り＝Pattern A 化を構造で防ぐ）: cc_class が unclear /
-    spurious_warn=True / needs-review(未記入) / **提案なし(CSVに該当エントリなし)** の
-    ときは y を出さず、ラベル一覧を強制表示する。
+    y=CC提案ラベルで確定 / 番号=ラベル選択 / s=スキップ / ?=全一覧 / q=終了。
+    摩擦（提案素通り＝Pattern A 化を構造で防ぐ）＝ _y_blocked_reason の方向性ガード:
+      unclear / needs-review(未記入) / 提案なし / **spurious警告+非spurious提案** は
+      y を出さない。spurious警告+spurious提案（正しい方向）だけは y を許可する。
+    batch_confirm=True: y 可の明快な提案を一括確定できる（迷うものは個別確認へ回す。
+      **黙って捨てない**）。既定 False＝従来どおり1件ずつ。
     確定は apply_label（method=human, confidence=1.0, 履歴 record_history=True）。
     """
     apply_fn = apply_fn or apply_label
@@ -457,96 +649,32 @@ def run_suggest_review(dirpath: str, suggest_csv: str,
     if verdict == "C":
         scope += " verdict=C"
     print_fn(f"○×UIレビュー: 対象 {len(items)} 件（{scope} / 提案元 {suggest_csv}）")
+
+    ctxs = [_build_suggest_ctx(item, suggest) for item in items]
     changed = 0
-    for n, item in enumerate(items, 1):
-        meta_path = item["meta_path"]
-        ann_index = item["ann_index"]
-        record = os.path.basename(meta_path)
-        if record.endswith(".sigmf-meta"):
-            record = record[: -len(".sigmf-meta")]
-        cur_label = item.get("label")
-        cur_method = item.get("method") or "rule"
-        cur_conf = item.get("confidence")
-        persist = (item.get("ann") or {}).get("sigscan:persistence")
-        snr = item.get("snr_db")
+    individual = ctxs
+    if batch_confirm:
+        # 仕分け: y 許可の明快なものだけ一括候補。迷うもの（unclear / needs-review /
+        # 提案なし / spurious警告+非spurious）は必ず個別確認へ（一括に混ぜない）。
+        batch = [c for c in ctxs if c["allow_y"]]
+        rest = [c for c in ctxs if not c["allow_y"]]
+        result, nconf = _batch_confirm(batch, input_fn, print_fn, apply_fn)
+        if result == "abort":
+            print_fn("\n中止しました（何も確定していません）。")
+            return 0
+        changed += nconf
+        # 一括後も個別グループは必ず回す。i 選択時は一括候補も個別へ回す。
+        individual = (batch + rest) if result == "individual" else rest
 
-        row = suggest.get(record)            # 提案 lookup（無ければ「提案なし」）
-        png = _png_path_for(meta_path) or "(なし)"
-        if row is not None:
-            cc_class = (row.get("cc_class") or "").strip()
-            cc_rationale = (row.get("cc_rationale") or "").strip()
-            spurious_warn = (row.get("spurious_warn") == "True")
-            recommend = (row.get("recommend") or "").strip()
-            proposed_label = cc_class_to_label(cc_class)
-            png = row.get("png") or png
-            cc_line = (f"  CC提案 : {proposed_label or '(写像なし)'}   "
-                       f"[cc_class={cc_class or '未記入'}]")
-            rationale_line = f"  根拠   : {cc_rationale or '-'}"
-            extra = (f" duty={row.get('duty', '?')}"
-                     f"{'(inconclusive)' if row.get('duty_inconclusive') == 'True' else ''}"
-                     f" spur={row.get('spurious_warn', '?')}")
-        else:
-            cc_class = ""
-            spurious_warn = False
-            recommend = ""
-            proposed_label = None
-            cc_line = "  CC提案 : (提案なし＝suggestions.csv に該当エントリなし)"
-            rationale_line = None
-            extra = ""
-
-        lines = [f"--- [{n}/{len(items)}] ---",
-                 f"  file   : {record}.sigmf-meta",
-                 f"  PNG    : {png}", cc_line]
-        if rationale_line:
-            lines.append(rationale_line)
-        lines.append(f"  客観   : tuner={item['center']/1e6:.3f}MHz "
-                     f"det_bw={item['bw']/1e6:.2f}MHz "
-                     f"SNR={snr if snr is not None else '?'}dB "
-                     f"persist={persist if persist is not None else '?'}{extra}")
-        lines.append(f"  現在   : label='{cur_label}' "
-                     f"(confidence={cur_conf}, method={cur_method})"
-                     + ("  ← 訂正対象" if cur_method == "human" else ""))
-        print_fn("\n".join(lines))
-
-        # 摩擦: 提案なし → y 不可。提案あり → 既存の y ブロック条件。
-        if row is None:
-            reason = "提案なし（suggestions.csv に該当エントリなし）"
-        else:
-            reason = _y_blocked_reason(cc_class, spurious_warn, recommend)
-        if reason == "":
-            try:
-                ans = input_fn("  この提案で確定してよいか？ "
-                               "[y=確定 / n=ラベル選択 / s=スキップ / q=終了] > ")
-            except EOFError:
-                print_fn("\n入力終了。中断します。")
-                break
-            ans = (ans or "").strip().lower()
-            if ans == "q":
-                print_fn("レビューを終了します。")
-                break
-            if ans in ("", "s"):
-                print_fn("  → スキップ")
-                continue
-            if ans == "y":
-                apply_fn(meta_path, ann_index, proposed_label, record_history=True)
-                changed += 1
-                print_fn(f"  → 確定: '{cur_label}' → '{proposed_label}' "
-                         f"(method=human, cc_class={cc_class})")
-                continue
-            # 'n' その他 → ラベル一覧へ
-        else:
-            print_fn(f"  ⚠ {reason} → 提案確定(y)は不可。ラベルを選択してください（skip 可）")
-
-        kind, new_label = _prompt_label(cands, input_fn, print_fn)
-        if kind == "quit":
-            print_fn("レビューを終了します。")
+    if batch_confirm and individual:      # 仕分け後の個別グループを明示（従来モードでは出さない）
+        print_fn(f"\n--- 個別確認: {len(individual)} 件 ---")
+    for n, ctx in enumerate(individual, 1):
+        st = _review_one(ctx, cands, n, len(individual),
+                         input_fn, print_fn, apply_fn)
+        if st == "quit":
             break
-        if kind == "skip":
-            print_fn("  → スキップ")
-            continue
-        apply_fn(meta_path, ann_index, new_label, record_history=True)
-        changed += 1
-        print_fn(f"  → 確定: '{cur_label}' → '{new_label}' (method=human)")
+        if st == "changed":
+            changed += 1
 
     print_fn(f"\n完了: {changed} 件を確定しました。")
     return 0
@@ -609,9 +737,14 @@ def main(argv=None) -> int:
                         "（例 \"2402MHz_1783530*\"）。特定レコードを狙い撃つ選別フィルタ。"
                         "--conf-max と併用で AND、単独なら信頼度に関わらず一致ファイルを対象")
     p.add_argument("--suggest", default=None, metavar="CSV",
-                   help="review_suggest の suggestions.csv を読み CC提案を ○×UI(y/n)で確定。"
-                        "y=提案ラベルで確定 / n=ラベル選択。安全弁: unclear/spurious/未記入は"
-                        " y 不可（ラベル選択強制）。--list 併用時は列挙のみ（確定しない）")
+                   help="review_suggest の suggestions.csv を読み CC提案を ○×UIで確定。"
+                        "y=提案ラベルで確定 / 番号=ラベル選択 / ?=全一覧。安全弁: unclear/"
+                        "未記入/『warn+非spurious提案』は y 不可（ラベル選択強制）。warn+spurious"
+                        "提案は y 可（正しい方向）。--list 併用時は列挙のみ（確定しない）")
+    p.add_argument("--batch-confirm", action="store_true", dest="batch_confirm",
+                   help="--suggest 併用時のみ有効。y 可の明快な提案を一括確定できる"
+                        "（迷うもの＝unclear/未記入/warn+非spurious は個別確認へ回す）。"
+                        "既定オフ＝従来どおり1件ずつ")
     p.add_argument("--include-human", action="store_true", dest="include_human",
                    help="method=human の確定済みレコードも対象に含める（訂正経路）。"
                         "--pattern と併用で特定の誤確定を呼び戻す。既定は rule のみ（従来）")
@@ -632,7 +765,10 @@ def main(argv=None) -> int:
                          pattern=args.pattern, **ih)
     if args.suggest is not None:        # ○×UI（対話確定）: 対象は走査+フィルタ・CSVは提案lookup
         return run_suggest_review(args.dir, args.suggest, conf_max=conf_max,
-                                  verdict=args.verdict, pattern=args.pattern, **ih)
+                                  verdict=args.verdict, pattern=args.pattern,
+                                  batch_confirm=args.batch_confirm, **ih)
+    if args.batch_confirm:              # --batch-confirm は --suggest 専用（単独は無視）
+        print("警告: --batch-confirm は --suggest と併用時のみ有効です（無視します）。")
     return run_review(args.dir, conf_max=conf_max, verdict=args.verdict,
                       pattern=args.pattern, **ih)
 
