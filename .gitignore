@@ -7,3 +7,8 @@ captures/
 .pytest_cache/
 simdata/
 runs/
+指示書_*.md
+bench/
+captures_off_4m/
+captures_off_none/
+captures_persist02/
