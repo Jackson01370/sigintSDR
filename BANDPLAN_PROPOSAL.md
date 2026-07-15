@@ -25,11 +25,21 @@
 
 ### 用途ラベル（粗め・初期）
 `WiFi` / `Bluetooth` / `Zigbee` / `Cellular` / `SatComm` / `GNSS` / `Radar` /
-`ETC-DSRC` / `Drone-FPV` / `Amateur` / `WPT` / `Unknown`
+`ETC-DSRC` / `Drone-FPV` / `Amateur` / `WPT` / `Spurious` / `Unknown`
 
 > 注: `Radar` は初期は1つに統合（気象/航空監視/船舶の細分化はしない）。
 > 細かな用途は「周波数帯 × 方式ラベル」の掛け合わせで後から推定する。
 > `WPT`（ワイヤレス電力伝送）は今回の一次情報調査で 2.4GHz 等に存在が判明したため追加。
+> **`Spurious`（受信機内部スプリアス）は 2026-07-15 追加**。HackRF の 40MHz クロック高調波
+> (2400/2440/2480MHz)・16MHz コム等は「電波」ではなく受信機が生む偽信号だが、実RFに常在し
+> CNN が最も誤認するため、**明示的に1クラスとして学習させる**（`spurious` として ground truth
+> を32件確定済み）。これは机上の一次情報には無く、実地の収集で発見したもの。専門家CNNは
+> これを「実信号ではない」と弾くために本クラスを持つ。詳細は `docs/ARCHITECTURE.md §9`・
+> `CLAUDE.md §7`（HackRF 固有スプリアス）。
+
+> **2.4GHz 専門家の当面のクラス（案Z・2026-07-15 確定）**: 上記のうち用途1軸で
+> `ble-adv`（=Bluetooth の下位）/ `wifi-24`（=WiFi 2.4G）/ `spurious` / `unknown` を採用。
+> `unknown` は教師0件のため当面3クラスで開始し蓄積後に追加。方式軸・2軸化は将来課題。
 
 ### 方式ラベル（粗め・初期）
 `OFDM` / `FHSS` / `DSSS` / `Chirp-LFM` / `FMCW` / `Pulse` / `PhaseCoded` /
