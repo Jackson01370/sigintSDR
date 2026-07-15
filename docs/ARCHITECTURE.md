@@ -152,6 +152,24 @@ HackRF One（SDR）で 1〜6GHz をスキャンして電波を自動識別する
 - **発火条件**: `--cnn` 有効かつ rule conf<0.85 のときのみ（既定 `CNNConfig.enabled=False`, `config.py:164`）。checkpoint 既定 `runs/m2_5`（`config.py:165`）。CNN が用途ラベルを勝手に書き換えることはない（C は Unknown 化のみ＝人間判断へ）。
 - ※ `classify.py:259-262` の `cnn_classify(spectrogram_db)` は**デッドスタブ**（常に None）。実CNNは上記監査経路。
 
+#### 5.2.1 専門家CNN学習コードを書くための材料（再利用 / 新規 / 論点）
+> 次タスク（2.4GHz ISM 専門家 CNN の学習コード作成）向けの地図。**事実は行番号付き・推測は「※」で明示**。ここは「何を流用でき、何を新規に書くか」の切り分けに徹する（時系列は worklog）。
+
+- **入力パイプライン（そのまま再利用可）**: `data.SpecDataset`（`cnntrain/data.py:40-66`）が SigMF→`sigmf_io.read_recording`→**凍結 `spec.render(iq, rate)`**（`data.py:62`）→`[1,256,256] float32 [0,1]` を返す。**sim も real も同一経路**（実データも同じ `spec.render`）。教師ラベルは `r.label`（＝SigMF `core:label`）＝**human確定ラベルがそのまま `y` になる**（`data.py:65`）。→ 専門家学習で `SpecDataset` と `spec.render` は無改修で流用。
+- **モデル（流用可・出力次元だけ変える）**: `build_model(n_classes, in_ch=1)`（`cnntrain/model.py:42-43`）は n_classes 可変。専門家は用途4クラス（ble-adv / wifi-24 / spurious / unknown）で `n_classes=4`。**方式軸5クラス学習器とはクラス体系が別物＝別 checkpoint の新規学習**（既存 `runs/m2_5` の再学習・上書きではない）。
+- **学習ループ本体（流用可）**: `_epoch_pass`（`train.py:55-80`）・モデル構築/Adam(lr=1e-3)/CrossEntropy/epochループ/checkpoint保存（`train.py:104-194`）は流用可。device 自動選択（`_select_device` `train.py:44-52`）で CUDA があれば GPU、無ければ CPU。
+- **チェックポイント（形式OK・置き場所は自由）**: `torch.save(dict(state_dict, classes, in_ch, meta))`→`<out_dir>/checkpoint.pt`（`train.py:192-194`）。out_dir は run 毎に任意＝**専門家モデルを別ディレクトリに置ける**。読込 `infer.load_checkpoint`（`infer.py:26-39`, `weights_only=True`）は `classes` を checkpoint から読むので**出力クラス数は自動追従**。meta に入力サイズ（256×256）は明記されず、`spec.IMG_FREQ/IMG_TIME` と model 側で暗黙固定（※）。
+- **実データを流す経路の穴（新規に書く①）**: `data.load_split`（`data.py:22-37`）は **`ds_mod.load_index(...).query(hw="sim")` をハードコード**（`data.py:30`）＝**実HackRFデータを構造的に除外**する。実データ学習には (a) `hw="real"` またはラベル絞りの索引取得を**書き足す**（`dataset.Dataset.query` は `hw='real'` グループ対応済み `dataset.py:159-175`／`hw_group` `dataset.py:33-40`）、(b) 用途4クラスの `class_names` を渡す、が要る。`run_training` は現状 `load_split` 依存なので、**実データ版の入口（別関数 or 引数）が新規実装点**。
+- **バンド別ルーティングの穴（新規に書く②・最重要）**: 「バンドに応じて専門家を呼ぶ」配管は **コード上に存在しない**。`scheduler` は `config.CNNConfig.checkpoint`（`config.py:162-165`, 既定 `runs/m2_5`）の**単一** checkpoint を1度だけロードし（`scheduler.py:88-96`）、**全バンドの検出に同じモデルを適用**する（`scheduler.py:349-354`）。`config.Band` dataclass（`config.py:175-189`）のフィールドは name/f_lo/f_hi/priority/hint のみで**モデル指定枠が無い**。→ 専門家を「2.4GHz 帯で自動起用」するには (a) `Band` にモデル参照 or バンド→checkpoint 対応表、(b) scheduler で「検出中心→バンド→専門家 checkpoint 選択」を**新規実装**する必要。**※ CLAUDE.md §6 および本調査を指示した文書の「専門家分割の配管（`BandPlan.cnn_model` / `classify.py` ルーティング分岐）は実装済み」は、コードと不一致**（`cnn_model` も `BandPlan` も全 `*.py` に grep 0 件・2026-07-15 確認。実体は上記の単一適用）。
+- **不均衡・分割・拡張の現状（対策ゼロ＝新規判断点③）**: 損失は素の `nn.CrossEntropyLoss()`（`train.py:117`）＝**クラス重み付けなし**。train/val 分割 `dataset.Dataset.split`（`dataset.py:226-248`）は **hw グループ内のランダム分割で、ラベル層化なし・交差検証なし**（seed 固定・先頭 `round(n*val_ratio)` を val）。**train 時の augmentation は無し**（`SpecDataset` は `spec.render` のみ、DataLoader は shuffle だけ・transform 無し）。合成の現実性ノイズ（DC残留 `simgen.py:113` / スプリアス線 `simgen.py:152`）は**生成時注入**で、実データには適用されない。
+- **早期終了・ベストモデル選択は無い**: `run_training` は全 epoch 回して**最終 epoch のモデルをそのまま保存**（`train.py:151-194`、val_acc は記録のみ `meta.final_val_acc`）。best-val 選択が要るなら新規。
+- **専門家学習に向けた論点（実装せず指摘・次タスク判断）**: ~91件・用途4クラス（実測 ble-adv 36 / spurious 32 / wifi-24 23 / **unknown 0**＝§7）で A（実データのみ・合成非混合＝案A）を回す難所 —
+  1. **層化なしのランダム分割**（`dataset.split`）だと val に少数クラスが 0 件落ちしうる → 層化分割か K-fold の検討（新規）。
+  2. **unknown クラスが 0 件**＝4クラス目の教師が無い → 3クラスで始めるか unknown を貯めてから4クラスにするかの判断。
+  3. **クラス不均衡**（36/32/23）→ 重み付き CE かサンプリング（現状どちらも無い）。
+  4. **augmentation の要否**（実データ少数の水増しの誘惑）→ 入れるなら **`spec.render` を迂回しない**範囲に限る（凍結表現が単一の真実）。
+  5. **ドメイン**: 実dwell 262144(~13ms) vs 合成 65536(~3.3ms) の長さ差（`classes.py:17`）。専門家は実データのみなので長さは実 13ms に揃うが、既存 `runs/m2_5` と入力統計が異なる点は留意（※影響未測定）。
+
 ### 5.3 LLM vision 段（`llmvision/`）— 実装済み＆配線済みだが**既定で休眠**
 - **実装は本物**（スタブではない）。プロバイダ: `gemini-2.5-flash` / `claude-haiku-4-5` / `gpt-4o-mini`（`llmvision/client.py:44-48`、env で上書き可）。実 HTTP 呼出（`urllib`）。
 - **配線**: `classify.py:264-265` が唯一の本番呼出。トリガは `png_path is not None かつ r.confidence < 0.5`。
@@ -182,15 +200,15 @@ HackRF One（SDR）で 1〜6GHz をスキャンして電波を自動識別する
 
 ## 7. データ資産の現状（読み取り時点のカウント）
 
-### ground truth（`method=human`、確定済み）— 実測カウント
-- **`captures/` の human確定 計 37件**: **BLE/Bluetooth (adv?) 35**、**WiFi (2.4GHz, 20/40MHz) 2**。
-- 達成チャネル: **ch38(2426) 3 ・ ch37(2402) 17 ・ ch39(2480) 15 = BLE 35**（`docs/worklog/...:13`。WiFi 2 は「棄却対象を正しく記録」した能動再ラベル）。
-- `captures/`: `*.sigmf-meta` **118件**（method 内訳: rule 72 / human 37 / cnn 9）。全ラベル文脈: BLE 77 / Zigbee 24 / 未識別信号 14 / WiFi 2 / 移動体衛星通信 1。
-- `captures/_review_pending/`: 83件（human **0**＝未確定）。`captures/_images/`: PNG 125枚。
+### ground truth（`method=human`、確定済み）— 実測カウント（2026-07-15 再計測）
+- **`captures/` の human確定 計 91件**（annotation 単位・全 376 meta を走査）: **BLE/Bluetooth (adv?) 36**、**スプリアス(HackRF内部) 32**、**WiFi (2.4GHz, 20/40MHz) 23**。**「未識別信号」の human確定は 0**（＝用途4クラス案の `unknown` はまだ教師 0 件）。
+- 前回記録（37件＝BLE35＋WiFi2）から **+54件**。増分は spurious 32（2440MHz 高調波の収集・確定）と WiFi +21・BLE +1。BLE のチャネル内訳は `docs/worklog/...` 参照（3チャネルで 35＋後続1）。
+- `captures/`: `*.sigmf-meta` **376件**（method 内訳: **rule 276 / human 91 / cnn 9**）。全ラベル文脈（annotation の `core:label`、human 以外も含む）: BLE 240 / Zigbee 50 / スプリアス(HackRF内部) 32 / 未識別信号 30 / WiFi 23 / 移動体衛星通信 1。
+- `captures/_review_pending/`: **110件**（human **0**＝未確定）。`captures/_images/`: PNG **353枚**。
 
 ### 合成データ・学習済みモデル
 - 合成学習セット `simdata/`: `.sigmf-meta` **300件**（5クラス×60、`core:hw="sigscan-sim (synthetic)"`）。
-- CNN checkpoint: **`runs/m2_5/checkpoint.pt`（198,754 B）が唯一の実体**。`runs/m1`・`runs/m2`・`runs/probe_real*` は **0バイトの空placeholder**。config 既定は `runs/m2_5`（実体あり）。
+- CNN checkpoint: **`runs/m2_5/checkpoint.pt`（198,754 B）が唯一の実体**。`runs/m1`・`runs/m2` は **0バイトの空placeholder**。config 既定は `runs/m2_5`（実体あり）。
 
 ---
 
