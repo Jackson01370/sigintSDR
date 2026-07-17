@@ -130,7 +130,14 @@ _SUGGEST_FIELDS = ["record", "png", "det_freq_mhz", "bw_mhz", "snr_db",
                    "recommend", "note"]
 
 
-def _make_suggest(tmp_path, rows):
+def _make_suggest(tmp_path, rows, make_images=None):
+    """合成 caps + suggestions.csv を作る。
+
+    make_images: 実 PNG を用意する record 名の集合（既定 None=作らない＝従来挙動）。
+      指定した record は <caps>/_images/<record>.png を実在させ、review 側の
+      ローカル PNG 解決（絶対パス表示）を検証できるようにする。
+    """
+    make_images = set(make_images or ())
     caps = tmp_path / "caps"; caps.mkdir(exist_ok=True)
     out = tmp_path / "out"; out.mkdir(exist_ok=True)
     sc = out / "suggestions.csv"
@@ -146,12 +153,15 @@ def _make_suggest(tmp_path, rows):
                 label=r.get("_cur_label", "BLE/Bluetooth (adv?)"),
                 method=r.get("_cur_method", "rule"),
                 confidence=float(r.get("_cur_conf", 0.62)))
+            if r["record"] in make_images:
+                img_dir = caps / "_images"; img_dir.mkdir(exist_ok=True)
+                (img_dir / (r["record"] + ".png")).write_bytes(b"\x89PNG")
     return str(caps), str(sc)
 
 
 def _run_suggest(tmp_path, rows, answers, include_human=False, pattern=None,
-                 batch_confirm=False):
-    caps, sc = _make_suggest(tmp_path, rows)
+                 batch_confirm=False, make_images=None):
+    caps, sc = _make_suggest(tmp_path, rows, make_images=make_images)
     prompts, printed, calls = [], [], []
     it = iter(answers)
 
@@ -177,12 +187,16 @@ def test_suggest_ui_ble_offers_y_and_confirms(tmp_path):
     rows = [dict(record="a", cc_class="ble-adv", recommend="confirm-ble",
                  spurious_warn="False", det_freq_mhz="2480.00", bw_mhz="1.20",
                  png="captures/_images/a.png")]
-    prompts, out, calls = _run_suggest(tmp_path, rows, ["y"])
+    # 実 PNG を用意し、ローカル解決（絶対パス表示）を検証する。
+    prompts, out, calls = _run_suggest(tmp_path, rows, ["y"], make_images=["a"])
     assert any("y=確定" in p for p in prompts)              # y が提示される
     assert len(calls) == 1
     assert calls[0]["new_label"] == "BLE/Bluetooth (adv?)"   # 提案ラベルで確定
     assert calls[0]["kw"].get("record_history") is True      # 履歴を残す
-    assert "captures/_images/a.png" in out                   # PNG を必ず表示
+    # PNG を必ず表示。feature 3 でローカル実在画像を絶対パスで示す（CSV の相対/"(なし)" を
+    # 素通ししない）。os.sep 差異を避けて basename と「(なし)/未生成でない」ことで確認。
+    assert "a.png" in out and "(なし)" not in out
+    assert "(画像未生成" not in out
 
 
 def test_suggest_ui_wifi_offers_y(tmp_path):

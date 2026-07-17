@@ -13,7 +13,7 @@ import sys
 
 from config import Config, dwell_samples_for_ms
 from store import Store
-from scheduler import HybridScheduler
+from scheduler import HybridScheduler, validate_collect_tag
 
 
 def _force_utf8():
@@ -68,6 +68,10 @@ def main():
                    help="収集するSNR下限dB(既定8)")
     p.add_argument("--collect-dedup-window", type=float, default=30.0,
                    metavar="SEC", help="収集側の近接重複排除の時間窓(秒, 既定30, 0で無効)")
+    p.add_argument("--tag", default=None, metavar="NAME",
+                   help="バッチタグ: 収集ファイル名に <freq>MHz_<tag>_<ts>_<n> の形で埋め込む。"
+                        "タイムスタンプが桁上がりしても --pattern \"*<tag>*\" でバッチ全体を"
+                        "一意選択できる（英数・ハイフン・アンダースコアのみ）。既定なし=従来命名")
     p.add_argument("--max-records", type=int, default=0, dest="max_records",
                    metavar="N",
                    help="収集の自動停止: N件SAVEしたら終了(既定0=無制限)。"
@@ -137,6 +141,13 @@ def main():
 
     p.add_argument("--quiet", action="store_true")
     args = p.parse_args()
+
+    # バッチタグの早期検証（不正なら実機初期化前にクリーンに停止＝ traceback を出さない）。
+    try:
+        collect_tag = validate_collect_tag(args.tag)
+    except ValueError as e:
+        print(f"エラー: {e}")
+        sys.exit(2)
 
     cfg = Config()
     if args.start is not None:
@@ -209,7 +220,8 @@ def main():
                             collect_dedup_s=args.collect_dedup_window,
                             dwell_mode=dwell_mode,
                             max_records=args.max_records,
-                            max_minutes=args.max_minutes)
+                            max_minutes=args.max_minutes,
+                            collect_tag=collect_tag)
     if dwell_mode:
         gate = "無効" if not cfg.quality.enabled else "厳しめ"
         print(f"滞在観測モード: 各対象に {cfg.dwell.dwell_seconds:g}s 滞在 / "
@@ -224,6 +236,8 @@ def main():
                   f"ピークメモリ≈{_mb:.0f}MB×観測回数。長尺時は --dwell-seconds を短めに")
     if args.collect:
         print(f"収集モード: SigMF を {args.collect}/ に保存 (SNR>={args.collect_snr}dB)")
+        if collect_tag:
+            print(f"バッチタグ: {collect_tag}（--pattern \"*{collect_tag}*\" で選択可）")
     if cfg.cnn.enabled:
         # スケジューラ構築が成功＝チェックポイントのロードに成功した後に表示する。
         print(f"CNN分類器: 有効 ({cfg.cnn.checkpoint}) [監査役/2段目]")

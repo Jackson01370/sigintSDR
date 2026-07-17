@@ -359,6 +359,42 @@ def write_classify_tasklist(out_dir: str, records: list[SuggestRecord],
     return path
 
 
+def format_cc_instruction_block(out_dir: str, records: list[SuggestRecord],
+                                data_dir: str, pattern: str) -> str:
+    """CC にそのまま貼れる指示文ブロックを組む（LLM 不使用・定型文の文字列組立のみ）。
+
+    実値（タスクリストパス・対象件数・正しい併合コマンド・§5 判断基準）を埋め込む。
+    プレースホルダ（<out> 等）は一切残さない。**分類内容の生成はしない**（道具のみ）。
+    """
+    n = len(records)
+    task_path = os.path.join(out_dir, "classify_tasklist.md")
+    verdicts_path = os.path.join(out_dir, "cc_verdicts.csv")
+    merge_cmd = (f'python -m cnntrain.review_suggest --data {data_dir} '
+                 f'--pattern "{pattern}" --out {out_dir} --verdicts {verdicts_path}')
+    bar = "─" * 74
+    lines = [
+        bar,
+        "▼ CC への指示（この枠内をそのまま Claude Code に貼る）",
+        bar,
+        f"{task_path} を読み、記載された全 {n} 件の PNG を view で開いて視覚分類する。",
+        "各 record の cc_class(ble-adv/wifi/spurious/hopping/unclear) と cc_rationale を決め、",
+        f"{verdicts_path} に `record,cc_class,cc_rationale` の CSV を書く。",
+        "書けたら次を実行して併合し confirm_sheet.md を完成させる:",
+        "",
+        f"  {merge_cmd}",
+        "",
+        "判断基準（CLAUDE.md §5・判断軸=検出帯(赤帯)の主役が何か・帯域外ブロブに引きずられない）:",
+        "  ble-adv : 検出帯内に収まる離散ブロブ(BW 1.0-1.6MHz)・間欠・spur_suspect=False",
+        "  wifi    : 検出帯を上下端まで貫く太い縦帯が繰り返す(20MHz級)。BW 3-5MHz でも窓切り取り",
+        "  spurious: 2400.0/2440.0/2480.0 付近の水平線、または spur_suspect=True",
+        "  hopping : 周波数方向に散らばる離散バースト(BT Classic の FHSS)",
+        "  unclear : 判断できない/検出帯に主役が居ない（無理にラベルを付けない）",
+        "  ※ det≈2400.0MHz または spur_suspect=True は cc_class に関わらず skip 強制（ガード）",
+        bar,
+    ]
+    return "\n".join(lines)
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -421,6 +457,9 @@ def main(argv=None) -> int:
         print(f"  Task : {task_path}")
         print("     → CC が全 PNG を view で分類し cc_verdicts.csv を書き、"
               "--verdicts 併合で再実行（人間の手作業を挟まず confirm_sheet まで到達）")
+        # コピペ用の指示文ブロック（実値入り・LLM 不使用の定型文）。パス打ち間違いを無くす。
+        print()
+        print(format_cc_instruction_block(args.out, records, args.data, args.pattern))
     return 0
 
 

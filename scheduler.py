@@ -7,6 +7,7 @@
 """
 from __future__ import annotations
 import os
+import re
 import time
 import itertools
 
@@ -19,6 +20,44 @@ import sigmf_io
 import spec
 import dwell
 import quality
+
+
+_TAG_ALLOWED = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+def validate_collect_tag(tag: str | None) -> str | None:
+    """バッチタグを検証して返す（英数・ハイフン・アンダースコアのみ）。
+
+    None / 空文字は None（＝タグなし＝従来命名）。不正文字を含めば ValueError を送出
+    （黙って握り潰さない）。タグは収集ファイル名に埋め込まれ、タイムスタンプが桁上がり
+    しても `--pattern "*<tag>*"` でバッチ全体を一意に選べるようにするためのもの。
+    """
+    if tag is None:
+        return None
+    t = str(tag).strip()
+    if t == "":
+        return None
+    if not _TAG_ALLOWED.match(t):
+        raise ValueError(
+            f"バッチタグ '{tag}' が不正です。英数・ハイフン(-)・アンダースコア(_) のみ"
+            "使用可（スペースやスラッシュ等は不可）。")
+    return t
+
+
+def collect_record_name(center_hz: float, collected_n: int,
+                        tag: str | None = None, ts_ms: int | None = None) -> str:
+    """収集レコードのベース名を組む（収集命名の唯一の点）。
+
+    形式: ``<freq>MHz_[<tag>_]<timestamp_ms>_<n>``。
+      * tag=None/空 → 従来命名 ``<freq>MHz_<ts>_<n>``（完全後方互換）。
+      * tag 指定 → 周波数直後にタグを挿入。``--pattern "*<tag>*"`` でバッチ全体を選べる。
+    ts_ms=None なら現在時刻(ms)。周波数先頭は既存挙動を踏襲（窓の下端で決まる）。
+    """
+    freq = int(round(center_hz / 1e6))
+    if ts_ms is None:
+        ts_ms = int(time.time() * 1000)
+    tagpart = f"{tag}_" if tag else ""
+    return f"{freq}MHz_{tagpart}{ts_ms}_{collected_n}"
 
 
 def dwell_tune_offset(bw_hz, offset_hz: float, max_bw_hz: float) -> float:
@@ -43,12 +82,17 @@ class HybridScheduler:
     def __init__(self, backend: SDRBackend, cfg: Config, store: Store | None = None,
                  collect_dir: str | None = None, collect_snr_min: float = 8.0,
                  collect_dedup_s: float = 30.0, dwell_mode: bool = False,
-                 max_records: int = 0, max_minutes: float = 0.0, time_fn=None):
+                 max_records: int = 0, max_minutes: float = 0.0, time_fn=None,
+                 collect_tag: str | None = None):
         self.be = backend
         self.cfg = cfg
         self.store = store
         self.collect_dir = collect_dir
         self.collect_snr_min = collect_snr_min
+        # バッチタグ（既定 None＝従来命名）。収集ファイル名に埋め込み、タイムスタンプ範囲を
+        # 跨いでも --pattern "*<tag>*" でバッチ全体を選べるようにする（validate 済み前提だが
+        # 呼び出し側で未検証でも壊れないよう、ここでも軽く検証する）。
+        self.collect_tag = validate_collect_tag(collect_tag)
         # 滞在観測モード（既定 off）。on だと各対象に滞在し反復観測 → 品質ゲートで
         # 選別して保存する。off は従来どおり1回ドウェルの収集経路。
         self.dwell_mode = dwell_mode
@@ -238,7 +282,7 @@ class HybridScheduler:
                 self._skipped_dup += 1
             else:
                 ann = sigmf_io.annotation_from_result(m, result)
-                name = f"{int(round(center_hz/1e6))}MHz_{int(time.time()*1000)}_{self._collected}"
+                name = collect_record_name(center_hz, self._collected, self.collect_tag)
                 sigmf_io.write_recording(
                     os.path.join(self.collect_dir, name),
                     iq, center_hz, c.sdr.dwell_rate_hz,
@@ -265,8 +309,7 @@ class HybridScheduler:
         （extra_global は不変＝OFF 時の保存出力は完全に同一）。
         """
         ann = sigmf_io.annotation_from_result(m, result)
-        name = (f"{int(round(obs.center_hz/1e6))}MHz_"
-                f"{int(time.time()*1000)}_{self._collected}")
+        name = collect_record_name(obs.center_hz, self._collected, self.collect_tag)
         base = os.path.join(self.collect_dir, name)
         # 適用したオフセットを来歴として記録（dwell_observe_cycle と同じ helper・同じ入力で
         #   再計算＝決定論的に一致。0.0 は不適用）。旧記録との区別はキーの有無で可能。

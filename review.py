@@ -211,7 +211,8 @@ def _png_path_for(meta_path: str) -> str | None:
     if base.endswith(".sigmf-meta"):
         base = base[: -len(".sigmf-meta")]
     png = os.path.join(os.path.dirname(meta_path), "_images", base + ".png")
-    return png if os.path.exists(png) else None
+    # 実在すれば絶対パスで返す（`\`/`/` 混在を解消し、端末で Ctrl+クリックして開ける形に）。
+    return os.path.abspath(png) if os.path.exists(png) else None
 
 
 def apply_label(meta_path: str, ann_index: int, new_label: str,
@@ -486,7 +487,7 @@ def _build_suggest_ctx(item: dict, suggest: dict) -> dict:
     record = os.path.basename(meta_path)
     if record.endswith(".sigmf-meta"):
         record = record[: -len(".sigmf-meta")]
-    png = _png_path_for(meta_path) or "(なし)"
+    png = _png_path_for(meta_path)           # 実在なら絶対パス、無ければ None
     row = suggest.get(record)                # 提案 lookup（無ければ「提案なし」）
     if row is not None:
         cc_class = (row.get("cc_class") or "").strip()
@@ -494,7 +495,13 @@ def _build_suggest_ctx(item: dict, suggest: dict) -> dict:
         spurious_warn = (row.get("spurious_warn") == "True")
         recommend = (row.get("recommend") or "").strip()
         proposed_label = cc_class_to_label(cc_class)
-        png = row.get("png") or png
+        # PNG はローカル実解決を最優先（suggestions.csv の png 列は auto-classify を画像生成前に
+        # 走らせると "(なし)" や相対パスで古びるため、実在するローカル画像を上書きさせない）。
+        # ローカルに無い場合のみ、CSV に実在パスがあれば絶対化して採用する。
+        if png is None:
+            csv_png = (row.get("png") or "").strip()
+            if csv_png and csv_png != "(なし)" and os.path.exists(csv_png):
+                png = os.path.abspath(csv_png)
         det = row.get("det_freq_mhz", "?")
         bw_sug = row.get("bw_mhz", "?")
         duty = (f"{row.get('duty', '?')}"
@@ -506,6 +513,9 @@ def _build_suggest_ctx(item: dict, suggest: dict) -> dict:
         proposed_label = None
         det = bw_sug = duty = "?"
         reason = "提案なし（suggestions.csv に該当エントリなし）"
+    # 画像が実在しなければ「(なし)」を素通しせず、次にすべき操作を明示する。
+    if png is None:
+        png = "(画像未生成: view_captures.py 実行)"
     return dict(
         meta_path=meta_path, ann_index=item["ann_index"], record=record,
         cur_label=item.get("label"), cur_method=item.get("method") or "rule",
@@ -588,7 +598,7 @@ def _batch_confirm(batch: list[dict], input_fn, print_fn, apply_fn):
     for i, c in enumerate(batch, 1):
         print_fn(f"  [{i}] {c['record']}  cc={c['cc_class']} → {c['proposed_label']}  "
                  f"det={c['det']}MHz bw={c['bw_sug']}MHz duty={c['duty']}")
-        print_fn(f"       PNG={c['png']}  根拠: {c['cc_rationale'] or '-'}")
+        print_fn(f"       PNG: {c['png']}  根拠: {c['cc_rationale'] or '-'}")
     try:
         ans = input_fn(f"\n上記 {len(batch)} 件を CC提案どおり確定しますか？ "
                        "[y=一括確定 / i=1件ずつ個別確認 / n=中止] > ")
