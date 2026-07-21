@@ -176,8 +176,11 @@ def _run_cnn_audit(r: ClassResult, measurement: dict,
 
     cnn_class, cnn_conf = infer.classify_iq(ctx.checkpoint, ctx.iq, ctx.rate)
     center = measurement.get("center_hz")
+    # checkpoint の出力クラス語彙を audit に渡す。専門家（用途3クラス）なら
+    # 専門家用の期待対応表で突き合わせ、汎用（方式軸）なら従来表（None も従来表）。
+    cnn_classes = getattr(ctx.checkpoint, "classes", None)
     decision = _audit.audit(r.label, r.confidence, cnn_class, cnn_conf,
-                            center_hz=center)
+                            center_hz=center, cnn_classes=cnn_classes)
 
     # 来歴（SigMF 用。呼び出し側＝scheduler が extra_global に載せる）。
     # 調整前後の確信度が追えること（rule_conf_pre / cnn_conf_post）。

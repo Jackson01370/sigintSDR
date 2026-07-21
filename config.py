@@ -249,6 +249,25 @@ BAND_PLAN: list[Band] = [
 ]
 
 
+# ---------------------------------------------------------------------------
+# バンド別 CNN ルーティング表（案Y）— バンド名 → 専門家 checkpoint
+#   単一グローバル checkpoint（CNNConfig.checkpoint＝汎用 runs/m2_5・方式軸5クラス）を
+#   全バンドに一律適用する既定に対し、「専門家 CNN があるバンドだけ」ここに書いて
+#   上書きする。ここに無いバンドは従来どおり汎用へフォールバック（後方互換）。
+#
+#   * キーは BAND_PLAN の **実際のバンド name** に一致させる（_match_band が返す name）。
+#   * 値は checkpoint のディレクトリ or ファイル（scheduler が中の checkpoint.pt を補完）。
+#   * config.Band dataclass は **変更しない**（31バンド全部にモデル枠を足さない＝案Y）。
+#     将来 5GHz 専門家等を足すときは、ここに 1 行追加するだけで済む。
+#   * 空 dict なら全バンド汎用＝現状と完全に同一挙動。
+#
+#   専門家は **監査（audit）専用**。ここでの切替は「どの CNN で監査するか」だけで、
+#   ラベル確定フロー（review.py の人手○×）には一切触れない（Pattern A を踏まない）。
+BAND_CNN_ROUTES: dict[str, str] = {
+    "ISM 2.4G (WiFi/BT)": "runs/ism24_v2",   # 2.4GHz ISM 専門家（用途3クラス）
+}
+
+
 @dataclass
 class Config:
     sdr: SDRConfig = field(default_factory=SDRConfig)

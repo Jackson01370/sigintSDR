@@ -255,7 +255,17 @@ def tiny_ckpt(tmp_path_factory):
 
 @pytest.mark.skipif(not HAS_TORCH, reason="torch 未導入（CNN e2e はスキップ）")
 def test_dwell_e2e_records_cnn_provenance(tmp_path, tiny_ckpt):
-    """ON: 滞在観測の保存 SigMF global に sigscan:cnn_* 来歴が載る（調整前後追跡可）。"""
+    """ON: 滞在観測の保存 SigMF global に sigscan:cnn_* 来歴が載る（調整前後追跡可）。
+
+    【2026-07-21 変更】バンド別 CNN ルーティング（案Y・config.BAND_CNN_ROUTES）導入に
+    伴い、本テストの scan 帯 2.4-2.5GHz の検出は **専門家 CNN（runs/ism24_v2・用途3クラス
+    ble-adv/wifi-24/spurious）** で監査されるようになった（汎用 runs/m2_5 ではない。
+    CNNConfig.checkpoint=tiny_ckpt は汎用として init でロードされるが、2.4GHz ISM 帯では
+    ルーティングが専門家を選ぶため使われない）。来歴が記録される検証意図は不変のまま、
+    cnn_class が **専門家3クラス**・cnn_checkpoint が **ism24_v2** であることを積極的に
+    固定する（＝ルーティングが 2.4GHz を専門家へ正しく回した証拠）。汎用5クラス監査の
+    ロジックは T12 群（audit 単体・cnn_classes=None→汎用表）が引き続き緑で担保し、
+    空ルート時の汎用フォールバック e2e は test_band_routing.py が担保する。"""
     import sigmf_io
     from sdr import SimBackend
     from scheduler import HybridScheduler
@@ -284,15 +294,28 @@ def test_dwell_e2e_records_cnn_provenance(tmp_path, tiny_ckpt):
     assert iq.dtype == np.complex64 and len(iq) > 0
 
     g = meta["global"]
-    # CNN 来歴（global）。来歴の必須キーが揃う。
+    # CNN 来歴（global）。来歴の必須キーが揃う（記録意図は不変）。
     for key in ("sigscan:cnn_class", "sigscan:cnn_conf", "sigscan:cnn_verdict",
                 "sigscan:cnn_checkpoint", "sigscan:rule_conf_pre"):
         assert key in g, f"{key} が global に無い"
     assert g["sigscan:cnn_verdict"] in (
         VERDICT_A, VERDICT_B, VERDICT_C, VERDICT_UNMAPPED)
-    assert g["sigscan:cnn_class"] in (
-        "cw-tone", "narrowband-burst", "noise-only", "pulse-radar",
-        "wideband-ofdm")
     assert 0.0 <= float(g["sigscan:cnn_conf"]) <= 1.0
     assert 0.0 <= float(g["sigscan:rule_conf_pre"]) <= 1.0
     assert g["sigscan:capture_mode"] == "dwell"     # 既存来歴も維持
+
+    # 【ルーティング積極検証】2.4GHz ISM 帯の保存レコードは専門家 CNN で監査される。
+    #   cnn_class は専門家3クラス、cnn_checkpoint は "ism24_v2"（＝2.4GHz→専門家へ
+    #   ルーティングされた証拠）。本 scan は 2.4-2.5GHz なので保存は全て ISM 帯に載る。
+    EXPERT_CLASSES = {"ble-adv", "wifi-24", "spurious"}
+    ism_records = 0
+    for mp in metas:
+        _, mt = sigmf_io.read_recording(mp[: -len(".sigmf-meta")])
+        gg = mt["global"]
+        fc = mt["captures"][0].get("core:frequency", 0.0)
+        if 2400.0e6 <= fc <= 2483.5e6:              # ISM 2.4G バンド内の検出
+            ism_records += 1
+            assert gg["sigscan:cnn_class"] in EXPERT_CLASSES, gg["sigscan:cnn_class"]
+            assert gg["sigscan:cnn_checkpoint"] == "ism24_v2", \
+                gg["sigscan:cnn_checkpoint"]
+    assert ism_records >= 1, "2.4GHz ISM の保存が 1 件は出て専門家監査されること"

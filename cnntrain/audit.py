@@ -25,7 +25,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from cnntrain.expected import match_expected, match_context
+from cnntrain.expected import (match_expected, match_context,
+                               tables_for_cnn_classes)
 
 
 # --- 係数（最小実装の固定値。根拠なき変更・チューニングループ禁止）---
@@ -56,17 +57,22 @@ class AuditDecision:
 
 def audit(rule_label: str | None, rule_conf: float,
           cnn_class: str, cnn_conf: float,
-          *, center_hz: float | None = None) -> AuditDecision:
+          *, center_hz: float | None = None,
+          cnn_classes=None) -> AuditDecision:
     """ルール結果 × CNN 所見 × バンドプラン文脈 → AuditDecision（純関数）。
 
     引数:
       rule_label : ルール判定の用途ラベル
       rule_conf  : ルール判定の確信度 [0,1]
-      cnn_class  : CNN の方式クラス（cnntrain.classes の語彙）
+      cnn_class  : CNN の所見クラス（汎用=方式軸 / 専門家=用途軸の語彙）
       cnn_conf   : CNN の softmax 確信度 [0,1]
       center_hz  : 中心周波数（(B) 文脈判定に必須。None なら文脈は不一致扱い）
+      cnn_classes: CNN の全出力クラス語彙（checkpoint.classes）。専門家（用途3クラス）
+                   なら専門家用の期待対応表で突き合わせる。**None（既定）は従来どおり
+                   汎用（方式軸）の表**＝後方互換（既存呼び出しは一切変わらない）。
     """
-    expect, _exp_note = match_expected(rule_label)
+    expected_table, context_rules = tables_for_cnn_classes(cnn_classes)
+    expect, _exp_note = match_expected(rule_label, expected_table)
 
     # (unmapped) 期待対応表に無い用途 → 監査役は黙る（所見は呼び出し側が記録）。
     if expect is None:
@@ -84,8 +90,8 @@ def audit(rule_label: str | None, rule_conf: float,
             f"{CONF_BONUS_A:.2f}（上限 {CONF_CAP_A:.2f}）。",
             sorted(expect), cnn_class, cnn_conf)
 
-    # 不整合: バンドプラン文脈で説明できるか（(B)）。
-    ctx = match_context(center_hz, rule_label, cnn_class)
+    # 不整合: バンドプラン文脈で説明できるか（(B)）。専門家表では文脈ルール空＝常に None。
+    ctx = match_context(center_hz, rule_label, cnn_class, context_rules)
     if ctx is not None:
         conf_after = max(rule_conf - CONF_PENALTY_B, CONF_FLOOR_B)
         return AuditDecision(

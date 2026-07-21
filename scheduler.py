@@ -25,6 +25,21 @@ import quality
 _TAG_ALLOWED = re.compile(r"^[A-Za-z0-9_-]+$")
 
 
+def _ckpt_display_name(path: str) -> str:
+    """checkpoint の来歴表示名。汎用も専門家も基本ファイル名は checkpoint.pt で
+    区別できないため、``<run>/checkpoint.pt`` の形なら **run ディレクトリ名**を返す
+    （例 runs/m2_5/checkpoint.pt → "m2_5"、runs/ism24_v2/checkpoint.pt → "ism24_v2"）。
+    それ以外はファイル名（basename）。SigMF の sigscan:cnn_checkpoint に載り、
+    どのモデルが監査したかを追える（バンド別ルーティングの観測に必須）。
+    """
+    base = os.path.basename(path)
+    if base == "checkpoint.pt":
+        parent = os.path.basename(os.path.dirname(path))
+        if parent:
+            return parent
+    return base
+
+
 def validate_collect_tag(tag: str | None) -> str | None:
     """バッチタグを検証して返す（英数・ハイフン・アンダースコアのみ）。
 
@@ -133,11 +148,28 @@ class HybridScheduler:
         self._cnn_enabled = bool(cnn_cfg is not None and cnn_cfg.enabled)
         self._cnn_ckpt = None
         self._cnn_ckpt_name = ""
+        # バンド別 CNN ルーティング（案Y）。専門家 checkpoint をバンド名で引く
+        #   キャッシュ。既定（BAND_CNN_ROUTES 空 or 該当なし）は汎用へフォールバック
+        #   ＝現状と完全同一挙動。専門家は監査専用（ラベル確定はしない）。
+        self._cnn_routes: dict[str, object] = {}        # band name -> Checkpoint
+        self._cnn_route_names: dict[str, str] = {}      # band name -> 来歴表示名
         if self._cnn_enabled:
             ckpt_path = self._resolve_cnn_checkpoint(cnn_cfg.checkpoint)
             from cnntrain import infer        # torch を引く: CNN 有効時のみ
             self._cnn_ckpt = infer.load_checkpoint(ckpt_path)
-            self._cnn_ckpt_name = os.path.basename(ckpt_path)
+            self._cnn_ckpt_name = _ckpt_display_name(ckpt_path)
+            # 専門家ルートを起動時に一括ロード（毎検出でロードし直さない）。同一
+            #   パスは 1 度だけロードして使い回す。フラグ ON かつ不在は明示エラー
+            #   （_resolve_cnn_checkpoint が送出＝汎用と同じ扱い・黙って無効化しない）。
+            from config import BAND_CNN_ROUTES
+            _by_path: dict[str, tuple] = {}
+            for band_name, route in BAND_CNN_ROUTES.items():
+                rp = self._resolve_cnn_checkpoint(route)
+                if rp not in _by_path:
+                    _by_path[rp] = (infer.load_checkpoint(rp),
+                                    _ckpt_display_name(rp))
+                self._cnn_routes[band_name] = _by_path[rp][0]
+                self._cnn_route_names[band_name] = _by_path[rp][1]
         self._last_survey = 0.0
         self._segments: list[dict] = []
         # ホットバンドを優先度の重み付きで巡回するためのイテレータ
@@ -166,6 +198,20 @@ class HybridScheduler:
                 f"CNN分類器(--cnn)が有効ですが、チェックポイントが見つかりません: "
                 f"{p}（--cnn-checkpoint で指定。無効化するには --cnn を外す）")
         return p
+
+    # --- バンド別ルーティング: 検出周波数 → 監査に使う checkpoint ---
+    def _select_cnn_for(self, center_hz: float):
+        """検出中心周波数 → (Checkpoint, 来歴表示名) を選ぶ（案Y・監査専用）。
+
+        中心周波数が属するバンドを **classify._match_band と同一判定** で求め
+        （＝ルール監査が使うのと同じバンド＝表と checkpoint がズレない）、
+        `BAND_CNN_ROUTES` に専門家があればそれ、無ければ汎用へフォールバック。
+        ルート未ロード（空表・CNN 無効）なら常に汎用（self._cnn_ckpt）＝後方互換。
+        """
+        band = classify._match_band(center_hz, self.cfg.bands)
+        if band is not None and band.name in self._cnn_routes:
+            return self._cnn_routes[band.name], self._cnn_route_names[band.name]
+        return self._cnn_ckpt, self._cnn_ckpt_name
 
     # --- フォーカス来歴 ---
     def _focus_global(self) -> dict:
@@ -390,10 +436,13 @@ class HybridScheduler:
                             and m["snr_db"] >= self.collect_snr_min)
             cnn_prov = None
             if self._cnn_enabled and is_candidate:
+                # バンド別ルーティング: 検出周波数で汎用/専門家を選ぶ（案Y）。
+                #   2.4GHz ISM 帯なら専門家 runs/ism24_v2、他は汎用 runs/m2_5。
+                ckpt, ckpt_name = self._select_cnn_for(obs.center_hz)
                 ctx = classify.CNNAuditContext(
-                    checkpoint=self._cnn_ckpt, iq=obs.best_iq,
+                    checkpoint=ckpt, iq=obs.best_iq,
                     rate=c.sdr.dwell_rate_hz, center_hz=obs.center_hz,
-                    checkpoint_name=self._cnn_ckpt_name)
+                    checkpoint_name=ckpt_name)
                 classify.set_cnn_context(ctx)
                 try:
                     result = classify.classify(m, c.bands)

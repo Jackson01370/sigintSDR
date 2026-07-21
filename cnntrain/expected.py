@@ -115,3 +115,51 @@ def match_context(center_hz: float | None, rule_label: str | None,
         if rule.freq_lo_hz <= center_hz <= rule.freq_hi_hz:
             return rule
     return None
+
+
+# ===========================================================================
+# (3) 専門家 CNN（2.4GHz ISM・用途3クラス）の期待対応表  ★ 用途↔用途の直対応 ★
+# ===========================================================================
+# 汎用 CNN は方式軸（見え方）だが、2.4GHz 専門家（runs/ism24_v2）は **用途軸**
+# （ble-adv / wifi-24 / spurious）を直接出す。したがって突き合わせは「用途ラベル
+# → 期待される専門家クラス集合」の **同義対応**（軸をまたがない）になる。
+#   ルール分類器の用途ラベル（classify.SIGNAL_DB / classify.SPURIOUS）と対応:
+#     専門家 ble-adv  ↔ "BLE/Bluetooth (adv?)"
+#     専門家 wifi-24  ↔ "WiFi (2.4GHz, 20/40MHz)"
+#     専門家 spurious ↔ "スプリアス(HackRF内部)"（rule_based は出さない語彙だが、対応は定義）
+# ここに無いルール用途（Zigbee/独自2.4G 等）は unmapped＝所見のみ記録・確信度不変
+# （新たな誤確定を生まない安全側）。専門家は監査専用でラベル確定はしない。
+EXPERT_ISM24_CLASSES = frozenset({"ble-adv", "wifi-24", "spurious"})
+
+EXPECTED_EXPERT_ISM24: list[ExpectedRow] = [
+    ExpectedRow(
+        ("ble", "bluetooth"),
+        frozenset({"ble-adv"}),
+        "[対応] 専門家 ble-adv ↔ ルール BLE/Bluetooth (adv?)（用途一致）。"),
+    ExpectedRow(
+        ("wifi",),
+        frozenset({"wifi-24"}),
+        "[対応] 専門家 wifi-24 ↔ ルール WiFi (2.4GHz, 20/40MHz)（用途一致）。"),
+    ExpectedRow(
+        ("スプリアス", "spurious"),
+        frozenset({"spurious"}),
+        "[対応] 専門家 spurious ↔ ルール スプリアス(HackRF内部)（用途一致）。"),
+]
+
+# 専門家には (B) バンドプラン文脈ルールを設けない（用途↔用途の直対応のため、
+# 「説明可能な不整合」は存在しない＝食い違いは即 (C)-conflict → Unknown 化）。
+CONTEXT_EXPERT_ISM24: list[ContextRule] = []
+
+
+def tables_for_cnn_classes(
+        cnn_classes) -> tuple[list[ExpectedRow], list[ContextRule]]:
+    """CNN の出力クラス語彙 → 監査に使う (期待対応表, 文脈ルール) を選ぶ。
+
+    専門家（用途3クラス ble-adv/wifi-24/spurious と完全一致）なら専門家用の表、
+    それ以外（汎用の方式軸5クラス・None・未知の語彙）は **既定（汎用）** の表。
+    「どのバンドで呼ばれたか」ではなく **checkpoint の語彙** で切り替えるので、
+    ルーティングと監査表が構造的に整合する（checkpoint と表がズレない）。
+    """
+    if cnn_classes is not None and set(cnn_classes) == EXPERT_ISM24_CLASSES:
+        return EXPECTED_EXPERT_ISM24, CONTEXT_EXPERT_ISM24
+    return EXPECTED_REAL, CONTEXT_RULES
