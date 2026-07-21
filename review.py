@@ -620,13 +620,92 @@ def _batch_confirm(batch: list[dict], input_fn, print_fn, apply_fn):
     return ("abort", 0)
 
 
+def _is_interactive() -> bool:
+    """対話端末なら True。ヘッドレス（claude -p・パイプ）では False。
+
+    コンタクトシート（表示補助）を開くのは**対話時のみ**（GUI が無い/邪魔な環境では
+    開かない＝禁止事項4）。stdin/stdout のどちらかが端末でなければ非対話（安全側）。
+    """
+    try:
+        return bool(sys.stdin.isatty()) and bool(sys.stdout.isatty())
+    except Exception:
+        return False
+
+
+def _open_file(path: str) -> None:
+    """既定ビューアでファイルを開く（Windows=os.startfile）。失敗しても握り潰す。"""
+    try:
+        if sys.platform.startswith("win"):
+            os.startfile(path)                        # type: ignore[attr-defined]
+        elif sys.platform == "darwin":
+            import subprocess
+            subprocess.Popen(["open", path])
+        else:
+            import subprocess
+            subprocess.Popen(["xdg-open", path])
+    except Exception:
+        pass
+
+
+def _default_sheet_path(suggest_csv: str) -> str:
+    """シート出力の既定パス: suggestions.csv と同じディレクトリの contact_sheet.png。
+
+    suggestions.csv は通常 bench/<out>/ にあるため、シートも bench/ 配下に出る
+    （captures/ には書かない）。dir が空なら bench/ にフォールバック。
+    """
+    d = os.path.dirname(os.path.abspath(suggest_csv)) or os.path.abspath("bench")
+    return os.path.join(d, "contact_sheet.png")
+
+
+def _under_captures(path: str) -> bool:
+    """path が captures/ 配下なら True（シートを captures に書かせないガード）。"""
+    ap = os.path.abspath(path)
+    cap = os.path.abspath("captures")
+    return ap == cap or ap.startswith(cap + os.sep)
+
+
+def _maybe_open_contact_sheet(ordered_ctxs, sheet_out, print_fn,
+                              open_fn=None, interactive=None):
+    """コンタクトシートを生成し（**対話時のみ**）自動で開く。表示補助のみ・確定に無関与。
+
+    open_sheet=True のときだけ呼ばれる（呼び出し側でガード済み）。非対話（ヘッドレス）
+    なら開かない（生成もしない）。captures/ 配下への出力は拒否して bench/ へ退避。
+    生成失敗はレビューを止めない（警告のみ）。returns 生成パス or None。
+    """
+    if not ordered_ctxs:
+        return None
+    if interactive is None:
+        interactive = _is_interactive()
+    if not interactive:
+        print_fn("[sheet] 非対話（ヘッドレス）のためコンタクトシートは開きません。")
+        return None
+    if _under_captures(sheet_out):
+        sheet_out = os.path.join(os.path.abspath("bench"), "_review_sheets",
+                                 "contact_sheet.png")
+        print_fn(f"[sheet] captures/ には書けないため出力先を {sheet_out} に退避します。")
+    try:
+        import contact_sheet                          # 遅延 import（matplotlib を引く）
+        entries = contact_sheet.sheet_entries(ordered_ctxs)
+        path = contact_sheet.build_contact_sheet(entries, sheet_out)
+    except Exception as e:                            # noqa: BLE001
+        print_fn(f"[sheet] 生成に失敗しました（レビューは継続）: {e}")
+        return None
+    if path:
+        print_fn(f"[sheet] コンタクトシート: {path}（自動で開きます・表示補助）")
+        (open_fn or _open_file)(path)
+    return path
+
+
 def run_suggest_review(dirpath: str, suggest_csv: str,
                        input_fn=input, print_fn=print,
                        include_human: bool = False, apply_fn=None,
                        conf_max: float = float("inf"),
                        verdict: str | None = None,
                        pattern: str | None = None,
-                       batch_confirm: bool = False) -> int:
+                       batch_confirm: bool = False,
+                       open_sheet: bool = False,
+                       sheet_out: str | None = None,
+                       open_fn=None, interactive: bool | None = None) -> int:
     """○×UI: CC 提案を確定する（摩擦=安全弁つき・一覧は既定非表示・? で展開）。
 
     **対象集合は走査＋フィルタで決める**（run_review と同一経路。suggestions.csv は
@@ -642,6 +721,11 @@ def run_suggest_review(dirpath: str, suggest_csv: str,
     batch_confirm=True: y 可の明快な提案を一括確定できる（迷うものは個別確認へ回す。
       **黙って捨てない**）。既定 False＝従来どおり1件ずつ。
     確定は apply_label（method=human, confidence=1.0, 履歴 record_history=True）。
+
+    open_sheet=True: レビュー対象の全 PNG を1枚のコンタクトシートにまとめ、各サムネイルに
+      [番号] cc_class を焼いて**対話時のみ自動で開く**（表示補助）。既定 False＝従来どおり
+      （パス表示のみ・シートなし）。ヘッドレスでは開かない。**シートは見るための補助で
+      あって、○×の判断・確定・摩擦・Pattern A 防波堤には一切関与しない**（表示だけの追加）。
     """
     apply_fn = apply_fn or apply_label
     # --- 対象集合＝走査＋フィルタ（既存の選別ロジックを再利用）---
@@ -668,6 +752,12 @@ def run_suggest_review(dirpath: str, suggest_csv: str,
         # 提案なし / spurious警告+非spurious）は必ず個別確認へ（一括に混ぜない）。
         batch = [c for c in ctxs if c["allow_y"]]
         rest = [c for c in ctxs if not c["allow_y"]]
+        # 表示補助: 提示順（batch→rest）でシートを生成し対話時のみ開く。番号は
+        #   _batch_confirm の一括候補 [1..N] と一致（確定・仕分けには一切関与しない）。
+        if open_sheet:
+            _maybe_open_contact_sheet(
+                batch + rest, sheet_out or _default_sheet_path(suggest_csv),
+                print_fn, open_fn=open_fn, interactive=interactive)
         result, nconf = _batch_confirm(batch, input_fn, print_fn, apply_fn)
         if result == "abort":
             print_fn("\n中止しました（何も確定していません）。")
@@ -675,6 +765,10 @@ def run_suggest_review(dirpath: str, suggest_csv: str,
         changed += nconf
         # 一括後も個別グループは必ず回す。i 選択時は一括候補も個別へ回す。
         individual = (batch + rest) if result == "individual" else rest
+    elif open_sheet:                      # batch_confirm 無しの --open-sheet 単独（個別順で1枚）
+        _maybe_open_contact_sheet(
+            ctxs, sheet_out or _default_sheet_path(suggest_csv),
+            print_fn, open_fn=open_fn, interactive=interactive)
 
     if batch_confirm and individual:      # 仕分け後の個別グループを明示（従来モードでは出さない）
         print_fn(f"\n--- 個別確認: {len(individual)} 件 ---")
@@ -758,6 +852,11 @@ def main(argv=None) -> int:
     p.add_argument("--include-human", action="store_true", dest="include_human",
                    help="method=human の確定済みレコードも対象に含める（訂正経路）。"
                         "--pattern と併用で特定の誤確定を呼び戻す。既定は rule のみ（従来）")
+    p.add_argument("--open-sheet", action="store_true", dest="open_sheet",
+                   help="--suggest 併用時のみ有効。対象の全 PNG を1枚のコンタクトシートに"
+                        "まとめ [番号] cc_class を焼いて対話時のみ自動で開く（表示補助）。"
+                        "ヘッドレスでは開かない。既定オフ＝従来どおり（パス表示のみ）。"
+                        "○×の判断・確定・摩擦には一切関与しない")
     args = p.parse_args(argv)
     # --conf-max 実効値: 明示指定を最優先。--pattern 単独なら信頼度を無視(inf)。
     #   どちらも無ければ従来既定 0.5（＝既存の対象選択・挙動は不変）。
@@ -770,15 +869,21 @@ def main(argv=None) -> int:
     # include_human は True のときだけ渡す（既定 False は各関数の既定に委ね、既存の
     #   呼び出し・mock シグネチャとの後方互換を保つ）。
     ih = {"include_human": True} if args.include_human else {}
+    # open_sheet も include_human と同様「True のときだけ注入」する（既定 False は
+    #   run_suggest_review の既定に委ね、既存の呼び出し・mock シグネチャとの後方互換を保つ）。
+    osheet = {"open_sheet": True} if args.open_sheet else {}
     if args.list:                       # --list は読み取りのみ（--suggest 併用でも列挙）
         return _cmd_list(args.dir, conf_max, verdict=args.verdict,
                          pattern=args.pattern, **ih)
     if args.suggest is not None:        # ○×UI（対話確定）: 対象は走査+フィルタ・CSVは提案lookup
         return run_suggest_review(args.dir, args.suggest, conf_max=conf_max,
                                   verdict=args.verdict, pattern=args.pattern,
-                                  batch_confirm=args.batch_confirm, **ih)
+                                  batch_confirm=args.batch_confirm,
+                                  **osheet, **ih)
     if args.batch_confirm:              # --batch-confirm は --suggest 専用（単独は無視）
         print("警告: --batch-confirm は --suggest と併用時のみ有効です（無視します）。")
+    if args.open_sheet:                 # --open-sheet も --suggest 専用（単独は無視）
+        print("警告: --open-sheet は --suggest と併用時のみ有効です（無視します）。")
     return run_review(args.dir, conf_max=conf_max, verdict=args.verdict,
                       pattern=args.pattern, **ih)
 

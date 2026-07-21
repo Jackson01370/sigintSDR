@@ -87,7 +87,7 @@ if ($DryRun) {
   Show-Cmd "3. 提案生成" @($py, "-m", "cnntrain.review_suggest", "--data", "captures/", "--pattern", "`"$pattern`"", "--out", $Out, "--auto-classify")
   $branch = if ($NoHeadless) { "(B) 待機フォールバック（-NoHeadless 指定）" } elseif (Get-Command claude -ErrorAction SilentlyContinue) { "(A) claude -p ヘッドレス自動（失敗時 B へ）" } else { "(B) 待機フォールバック（claude CLI 不在）" }
   Write-Host "`n>>> 4. CC分類 → $branch" -ForegroundColor Yellow
-  Show-Cmd "5. 人間の○×（ここで人間が y/n を押す）" @($py, "review.py", "captures/", "--pattern", "`"$pattern`"", "--suggest", $suggestions, "--batch-confirm")
+  Show-Cmd "5. 人間の○×（ここで人間が y/n を押す）" @($py, "review.py", "captures/", "--pattern", "`"$pattern`"", "--suggest", $suggestions, "--batch-confirm", "--open-sheet")
   Write-Host "`n[DryRun] 実際の収集・確定は行っていません。" -ForegroundColor Magenta
   exit 0
 }
@@ -178,9 +178,12 @@ if (-not (Test-Path $suggestions)) {
 # =========================================================================
 # 5. 人間の○×（ここで人間が y/n を押す。ラッパーは代行しない）
 # =========================================================================
-Show-Cmd "5. 人間の○×（人間が y/n を押す）" @($py, "review.py", "captures/", "--pattern", "`"$pattern`"", "--suggest", $suggestions, "--batch-confirm")
+Show-Cmd "5. 人間の○×（人間が y/n を押す）" @($py, "review.py", "captures/", "--pattern", "`"$pattern`"", "--suggest", $suggestions, "--batch-confirm", "--open-sheet")
 Write-Host "    ↓ ここから先は人間の確定操作です（AI は代行しません）。" -ForegroundColor Green
-& $py review.py captures/ --pattern "$pattern" --suggest $suggestions --batch-confirm
+# --open-sheet: 対話の人間○×なので全 PNG を1枚のコンタクトシートにまとめて自動で開く
+#   （表示補助のみ・確定は人間）。ヘッドレスのステップ4-A(claude -p)は review.py を
+#   呼ばないためシートは付かない（GUI 不要）。
+& $py review.py captures/ --pattern "$pattern" --suggest $suggestions --batch-confirm --open-sheet
 
 # =========================================================================
 # 終了サマリ
