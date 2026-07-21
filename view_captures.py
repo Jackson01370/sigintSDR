@@ -200,6 +200,45 @@ def render_one(base: str, out_path: str, flatten_dc: bool = False) -> dict:
     return info
 
 
+def select_metas(dirpath: str, pattern: str | None = None,
+                 limit: int | None = None) -> list[str]:
+    """描画対象の *.sigmf-meta パス一覧（ソート済み）を返す。
+
+    pattern 指定時は **ファイル名(ベース) が glob パターンに一致**するものだけを対象に
+    する（`glob(pattern + ".sigmf-meta")`＝review.py / review_suggest と同じ pattern 意味
+    論。例 "*ble_ch39c*" でタグ入りバッチのみ）。未指定は全件（従来どおり）。
+    limit は先頭から N 件（既存挙動・pattern 適用の後に効く）。
+    """
+    glob_pat = (pattern + ".sigmf-meta") if pattern else "*.sigmf-meta"
+    metas = sorted(glob.glob(os.path.join(dirpath, glob_pat)))
+    if limit:
+        metas = metas[:limit]
+    return metas
+
+
+def _needs_render(base: str, out_path: str, force: bool = False) -> bool:
+    """この record を描画すべきか（冪等スキップの判定・**保守的**）。
+
+    force=True は常に True（従来の全再描画）。それ以外は、出力 PNG が存在し、その mtime が
+    SigMF（.sigmf-meta / .sigmf-data の新しい方）の mtime **以上**なら描画不要＝False。
+    PNG が無い / SigMF より古い / mtime 取得失敗は **True（描画する）**＝欠損や不整合で
+    「描かれない」事故を避ける（不整合時は描く側へ倒す）。spec.render は呼ばない純関数。
+    """
+    if force:
+        return True
+    try:
+        if not os.path.exists(out_path):
+            return True
+        png_m = os.path.getmtime(out_path)
+        src_m = os.path.getmtime(base + ".sigmf-meta")
+        data = base + ".sigmf-data"
+        if os.path.exists(data):
+            src_m = max(src_m, os.path.getmtime(data))
+        return png_m < src_m            # PNG が SigMF より古ければ描画
+    except OSError:
+        return True                     # mtime 取得失敗は保守的に描画
+
+
 def main(argv=None) -> int:
     _force_utf8()
     p = argparse.ArgumentParser(
@@ -207,27 +246,39 @@ def main(argv=None) -> int:
     p.add_argument("dir", help="SigMF を格納したディレクトリ（例: captures/）")
     p.add_argument("--out", default=None, help="画像の出力先（既定: <dir>/_images）")
     p.add_argument("--limit", type=int, default=None, help="先頭から処理する件数")
+    p.add_argument("--pattern", default=None, metavar="GLOB",
+                   help="ファイル名(ベース)が GLOB に一致する SigMF だけ描画する"
+                        "（例 \"*ble_ch39c*\" で新規タグ分のみ）。未指定は全件（従来）")
+    p.add_argument("--force", action="store_true",
+                   help="冪等スキップを無効化し全対象を再描画する（既定はスキップ ON：既存 "
+                        "PNG が SigMF 以上に新しい record は再描画しない）")
     p.add_argument("--flatten-dc", action="store_true",
                    help="表示時に中央のDCスパイク残留を平坦化（時間変動DC追従ハイパス）。"
                         "保存済み生IQには触れない")
     args = p.parse_args(argv)
 
-    metas = sorted(glob.glob(os.path.join(args.dir, "*.sigmf-meta")))
+    metas = select_metas(args.dir, pattern=args.pattern, limit=args.limit)
     if not metas:
+        if args.pattern:                # 一致0件は正常終了（エラーにしない）
+            print(f"0 件（パターン一致なし）: pattern={args.pattern!r} / {args.dir}")
+            return 0
         print(f"SigMF が見つかりません: {args.dir}")
         return 1
-    if args.limit:
-        metas = metas[: args.limit]
 
     out_dir = args.out or os.path.join(args.dir, "_images")
     os.makedirs(out_dir, exist_ok=True)
 
-    print(f"画像化: {len(metas)} 件 → {out_dir}")
-    ok = 0
+    pat_s = args.pattern if args.pattern else "(全件)"
+    skip_s = "OFF(--force)" if args.force else "ON"
+    print(f"画像化: 対象 {len(metas)} 件 → {out_dir}  (pattern={pat_s} / skip={skip_s})")
+    ok = skipped = ng = 0
     for mp in metas:
         base = mp[: -len(".sigmf-meta")]
         name = os.path.basename(base)
         out_path = os.path.join(out_dir, name + ".png")
+        if not _needs_render(base, out_path, force=args.force):
+            skipped += 1                # 既存 PNG が最新 → spec.render を呼ばずスキップ
+            continue
         try:
             info = render_one(base, out_path, flatten_dc=args.flatten_dc)
             tag = label_text(info)
@@ -235,8 +286,14 @@ def main(argv=None) -> int:
             ok += 1
         except Exception as e:  # noqa: BLE001 - 1件失敗で全体を止めない
             print(f"  NG  {name}: {e.__class__.__name__}: {e}")
+            ng += 1
 
-    print(f"\n完了: {ok}/{len(metas)} 枚を {out_dir} に保存しました。")
+    print(f"\n完了: 描画 {ok} 件 / スキップ {skipped} 件"
+          + (f" / 失敗 {ng} 件" if ng else "")
+          + f"（対象 {len(metas)} 件）→ {out_dir}")
+    if skipped and not args.force:
+        print(f"  ※ スキップ {skipped} 件は既存 PNG が SigMF より新しいため再描画せず"
+              "（全再描画は --force）。")
     print("画像をエクスプローラーで開いて確認してください。")
     return 0
 
