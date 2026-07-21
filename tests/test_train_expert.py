@@ -11,6 +11,8 @@ captures/ は触らない（tmp のみ）。runs/m2_5 も触らない（out は 
 """
 import numpy as np
 import pytest
+import torch
+import torch.nn as nn
 
 import classify
 import sigmf_io
@@ -121,3 +123,135 @@ def test_expert_training_smoke(tmp_path):
     assert ck.meta.get("real_data") is True and ck.meta.get("synthetic_only") is False
     # 学習成果物が出ている。
     assert (out / "report.txt").exists() and (out / "history.json").exists()
+
+
+# ==========================================================================
+# v2 追加: best-val 保存 / early-stopping / k-fold（指示書_専門家CNN再学習.md）
+# ==========================================================================
+
+class _Tiny(nn.Module):
+    """state_dict に単一パラメータ w を持つだけの極小モデル（重み追跡用）。"""
+    def __init__(self):
+        super().__init__()
+        self.w = nn.Parameter(torch.zeros(1))
+
+    def forward(self, x):
+        return x
+
+
+def _fake_epoch_factory(val_schedule):
+    """`_epoch_pass` の差し替え: train パスで w←epoch 番号、val パスで schedule を返す。
+
+    これで「best epoch の重み」を確実に識別できる（w の値＝そのときの epoch）。
+    """
+    state = {"epoch": 0}
+
+    def fake(model, loader, criterion, optimizer=None, device=None):
+        if optimizer is not None:                 # train パス（epoch 開始）
+            state["epoch"] += 1
+            with torch.no_grad():
+                for p in model.parameters():
+                    p.fill_(float(state["epoch"]))
+            return 0.1, 1.0
+        return 0.2, val_schedule[state["epoch"] - 1]   # val パス
+    return fake
+
+
+# v2-1. best-val 保存: 最終 epoch でなく最良 epoch の重みが保存される。
+def test_train_loop_saves_best_not_last(monkeypatch):
+    model = _Tiny()
+    opt = torch.optim.SGD(model.parameters(), lr=0.0)
+    val = [0.5, 0.9, 0.6, 0.55]                    # 最良=epoch2, 最終=epoch4
+    monkeypatch.setattr(te, "_epoch_pass", _fake_epoch_factory(val))
+    history, best = te._train_loop(model, None, None, None, opt,
+                                   torch.device("cpu"), epochs=4)
+    assert best["epoch"] == 2 and best["val_acc"] == pytest.approx(0.9)
+    assert best["stopped_epoch"] == 4              # early-stop なしで全 epoch 実行
+    assert len(history) == 4
+    # best["state"] は epoch2 の重み(=2.0)。現モデルは epoch4(=4.0)＝ best≠last。
+    assert float(best["state"]["w"]) == pytest.approx(2.0)
+    assert float(next(iter(model.parameters()))) == pytest.approx(4.0)
+
+
+# v2-2. early-stopping: patience 超過で停止し、保存重みは停止 epoch でなく best。
+def test_train_loop_early_stops_and_keeps_best(monkeypatch):
+    model = _Tiny()
+    opt = torch.optim.SGD(model.parameters(), lr=0.0)
+    val = [0.9, 0.8, 0.8, 0.8, 0.8, 0.8]           # epoch1 最良、その後停滞
+    monkeypatch.setattr(te, "_epoch_pass", _fake_epoch_factory(val))
+    history, best = te._train_loop(model, None, None, None, opt,
+                                   torch.device("cpu"), epochs=6, patience=2)
+    # epoch1 best → epoch2 未改善(1) → epoch3 未改善(2>=patience) → epoch3 停止。
+    assert best["stopped_epoch"] == 3 and len(history) == 3
+    assert best["epoch"] == 1
+    # 保存重みは停止 epoch(3) ではなく best(1) の重み(=1.0)。
+    assert float(best["state"]["w"]) == pytest.approx(1.0)
+
+
+# v2-3. stratified k-fold: 各 fold が全クラスを train/val に含み、val が全体を重複なく覆う。
+def test_stratified_kfold_covers_and_partitions():
+    class _R:
+        def __init__(self, p): self.path = p
+    items = ([(_R(f"ble{i}"), "ble-adv") for i in range(9)]
+             + [(_R(f"wf{i}"), "wifi-24") for i in range(6)]
+             + [(_R(f"sp{i}"), "spurious") for i in range(6)])
+    k = 3
+    splits = te.stratified_kfold(items, k=k, seed=0)
+    assert len(splits) == k
+    all_val = []
+    for train, val in splits:
+        assert {c for _, c in val} == {"ble-adv", "wifi-24", "spurious"}
+        assert {c for _, c in train} == {"ble-adv", "wifi-24", "spurious"}
+        assert len(train) + len(val) == len(items)          # 各 fold は全体を覆う
+        all_val += [r.path for r, _ in val]
+    assert sorted(all_val) == sorted(r.path for r, _ in items)   # val は全体を覆う
+    assert len(all_val) == len(set(all_val))                     # val は重複なし
+    # 決定的（同 seed で同分割）。
+    s2 = te.stratified_kfold(items, k=k, seed=0)
+    assert ([[r.path for r, _ in v] for _, v in splits]
+            == [[r.path for r, _ in v] for _, v in s2])
+    with pytest.raises(ValueError):                              # k<2 はエラー
+        te.stratified_kfold(items, k=1)
+
+
+# v2-4. クラス重み: 増量件数(60/93/39)での逆頻度重みが期待通り。
+def test_inverse_freq_weights_increased_counts():
+    class _R:
+        def __init__(self, p): self.path = p
+    items = ([(_R(f"a{i}"), "ble-adv") for i in range(60)]
+             + [(_R(f"b{i}"), "wifi-24") for i in range(93)]
+             + [(_R(f"c{i}"), "spurious") for i in range(39)])
+    w = te.inverse_freq_weights(items, te.EXPERT_CLASSES)
+    n, k = 192, 3
+    assert w[0] == pytest.approx(n / (k * 60))    # ble
+    assert w[1] == pytest.approx(n / (k * 93))    # wifi（最多＝最軽）
+    assert w[2] == pytest.approx(n / (k * 39))    # spurious（最少＝最重）
+    assert w[2] > w[0] > w[1]                      # 少数クラスほど重い
+
+
+# v2-5. スモーク: run_expert_v2 が k-fold 評価＋最終 best-val checkpoint を作る。
+def test_expert_v2_smoke_kfold_and_final(tmp_path):
+    data = tmp_path / "caps"; data.mkdir()
+    for i in range(6):
+        _write_real(data, f"ble{i}", "BLE/Bluetooth (adv?)", method="human", seed=i)
+        _write_real(data, f"wf{i}", "WiFi (2.4GHz, 20/40MHz)", method="human", seed=100 + i)
+        _write_real(data, f"sp{i}", classify.SPURIOUS, method="human", seed=200 + i)
+    out = tmp_path / "runs" / "ism24_v2_test"
+    res = te.run_expert_v2(str(data), str(out), k=2, epochs=1, batch_size=4,
+                           seed=0, val_ratio=0.25, patience=None,
+                           log=lambda *a, **k: None)
+    # k-fold サマリ（平均±分散・合算混同行列）。
+    kf = res["kfold"]
+    assert kf is not None and len(kf["fold_val_acc"]) == 2
+    assert "mean_val_acc" in kf and "std_val_acc" in kf
+    assert len(kf["confusion"]) == 3 and len(kf["confusion"][0]) == 3
+    assert (out / "kfold_report.json").exists() and (out / "kfold_report.txt").exists()
+    # 最終 checkpoint: best-val 保存・k-fold サマリ入り meta。
+    ckpt = out / "checkpoint.pt"
+    assert ckpt.exists()
+    ck = infer.load_checkpoint(str(ckpt))
+    assert ck.classes == ["ble-adv", "wifi-24", "spurious"]
+    assert ck.meta.get("saved") == "best-val"
+    assert ck.meta.get("best_epoch") is not None
+    assert ck.meta.get("kfold") is not None            # meta に k-fold サマリ併記
+    assert ck.meta.get("real_data") is True and ck.meta.get("synthetic_only") is False
