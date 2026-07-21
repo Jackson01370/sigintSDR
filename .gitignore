@@ -12,3 +12,4 @@ bench/
 captures_off_4m/
 captures_off_none/
 captures_persist02/
+.tmp.driveupload/
