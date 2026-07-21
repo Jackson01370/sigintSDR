@@ -83,7 +83,7 @@ function Show-Cmd([string]$label, [string[]]$cmd) {
 if ($DryRun) {
   Write-Host "`n[DryRun] 実行はせず、流れるコマンド列を表示します:" -ForegroundColor Magenta
   Show-Cmd "1. 収集" (@($py, "main.py", "--hardware", "--start", $Start, "--stop", $Stop, "--focus", "--dwell-seconds", $Dwell, "--q-min-persistence", $QMinPersistence) + $gateArgs + @("--max-records", $Max, "--tag", $Tag, "--collect", "captures/"))
-  Show-Cmd "2. 画像化" @($py, "view_captures.py", "captures/")
+  Show-Cmd "2. 画像化" @($py, "view_captures.py", "captures/", "--pattern", "`"$pattern`"")
   Show-Cmd "3. 提案生成" @($py, "-m", "cnntrain.review_suggest", "--data", "captures/", "--pattern", "`"$pattern`"", "--out", $Out, "--auto-classify")
   $branch = if ($NoHeadless) { "(B) 待機フォールバック（-NoHeadless 指定）" } elseif (Get-Command claude -ErrorAction SilentlyContinue) { "(A) claude -p ヘッドレス自動（失敗時 B へ）" } else { "(B) 待機フォールバック（claude CLI 不在）" }
   Write-Host "`n>>> 4. CC分類 → $branch" -ForegroundColor Yellow
@@ -112,8 +112,10 @@ if ($collected -eq 0) {
 # =========================================================================
 # 2. 画像化
 # =========================================================================
-Show-Cmd "2. 画像化" @($py, "view_captures.py", "captures/")
-& $py view_captures.py captures/
+Show-Cmd "2. 画像化" @($py, "view_captures.py", "captures/", "--pattern", "`"$pattern`"")
+# --pattern "*<Tag>*": 新規タグ分だけ描画（+冪等スキップで既存最新はスキップ）＝高速化。
+#   全再描画したいときは view_captures.py に --force（このラッパーは新規分のみ描く）。
+& $py view_captures.py captures/ --pattern "$pattern"
 if ($LASTEXITCODE -ne 0) {
   Write-Host "エラー: 画像化(view_captures.py)が失敗しました（exit=$LASTEXITCODE）。中止します。" -ForegroundColor Red
   exit 1
