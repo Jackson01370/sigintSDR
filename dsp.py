@@ -116,8 +116,46 @@ def measure_signal(iq: np.ndarray, rate: float, center_hz: float) -> dict:
 
     信号が取得帯域(IBW)をほぼ埋めている場合は床が取れないため、
     occupied_frac を見て帯域幅を「≥ IBW」として扱う。
+
+    ※ この関数は CONTRACT §3 の継ぎ目(seam)。シグネチャ ["iq","rate","center_hz"] は
+      test_seams.py がロックしており変更しない。DC残留ガード付きの派生が要るときは
+      引数を足さず、下の measure_signal_dc_guarded（本体を共有）を使う。
+    """
+    return _measure_from_iq(iq, rate, center_hz, dc_guard_hz=0.0)
+
+
+def measure_signal_dc_guarded(iq: np.ndarray, rate: float, center_hz: float,
+                              dc_guard_hz: float) -> dict:
+    """measure_signal に DC残留ガードを足した opt-in 版（seam を汚さない兄弟関数）。
+
+    dc_guard_hz>0 のとき、チューナー中心 ± dc_guard_hz(Hz) を「窓の主役」候補から
+    除外して測る（除外後の最強＝次に強い本物を拾う）。判定は取得IQの中心相対
+    （0Hz=チューナ中心=DC残留の位置）ゆえ構造的にチューナ相対で、絶対周波数固定の
+    スプリアスとは別物。dc_guard_hz<=0 は measure_signal と完全に同一（1ビットも
+    変わらない）。戻り値の dict 形は measure_signal と同一。
+    """
+    return _measure_from_iq(iq, rate, center_hz, dc_guard_hz=float(dc_guard_hz))
+
+
+def _measure_from_iq(iq: np.ndarray, rate: float, center_hz: float,
+                     dc_guard_hz: float) -> dict:
+    """measure_signal / measure_signal_dc_guarded の共有本体。
+
+    dc_guard_hz=0（既定）では DC残留ガードの分岐に入らず、従来の measure_signal と
+    完全に同一の計算経路をたどる（出力はビット等価）。
     """
     freqs, p = welch_psd(iq, rate)
+    if dc_guard_hz > 0:
+        # DC残留ガード（opt-in）: チューナ中心 ±dc_guard_hz を候補から外す。freqs は
+        #   中心相対（0=チューナ中心=DC残留）なので |freqs|<=dc_guard_hz が除外帯。
+        #   除外後に残った freqs/p だけでピーク選択・床・SNR・帯域幅・重心を測るので、
+        #   DC残留が最強でも次に強い本物が主役として選ばれる。offset併用時は center_hz が
+        #   オフセット適用後の実チューナ中心なので、その中心基準で除外される。
+        keep = np.abs(freqs) > dc_guard_hz
+        if keep.any():                       # ガード外に測れるビンが残る → そこだけで測る
+            freqs, p = freqs[keep], p[keep]
+        # keep が全 False（ガードが取得帯域全体を覆う退化設定）は除外せず素通り
+        #   （例外を出さない）。実運用外の値なので従来測定へフォールバック。
     floor = float(np.percentile(p, 20))      # ロバストな床（信号占有が高くても効く）
     peak_db = float(p.max())
     snr = peak_db - floor

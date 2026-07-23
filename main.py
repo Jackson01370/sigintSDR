@@ -98,6 +98,14 @@ def main():
                    help="dwell収集時にチューナー中心へ加算するオフセットHz（狭帯域の獲物を"
                         "取得帯域の中央=DC位置から避け、dc-spike の構造落ちを防ぐ）。"
                         "既定0=無効（従来挙動）。サーベイには適用しない")
+    p.add_argument("--dc-guard-hz", type=float, default=None, metavar="HZ",
+                   help="DC残留ガード: dwell測定でチューナー中心±HZを『窓の主役』候補から"
+                        "除外し、次に強い本物の信号を拾う（1GHz以下の DC 残留対策）。"
+                        "既定0=無効（従来挙動と完全一致）。サーベイには適用しない。判定は"
+                        "チューナ相対（絶対周波数固定のスプリアスとは別物）。注意: 本物が"
+                        "たまたま中心にあると除外される→その場合は --dwell-offset-hz を併用。"
+                        "--dwell-offset-hz と補完関係（offsetは獲物をDCから避け、本ガードは"
+                        "DCを候補から外す）で併用可")
     # --- 品質ゲートのしきい値オーバーライド（既定は config の厳しめ値）---
     p.add_argument("--q-detect-snr", type=float, default=None, metavar="DB",
                    help="1観測で検出とみなすSNR下限dB")
@@ -177,6 +185,8 @@ def main():
         cfg.dwell.obs_interval_s = args.obs_interval
     if args.dwell_offset_hz is not None:
         cfg.sdr.dwell_offset_hz = args.dwell_offset_hz
+    if args.dc_guard_hz is not None:
+        cfg.sdr.dc_guard_hz = args.dc_guard_hz
     # 取得スナップショット長の上書き（既定 2^18≒13ms）。scheduler は両取得経路とも
     # cfg.sdr.dwell_samples を読むので、ここで差し替えれば dwell.py/scheduler.py は不変。
     if args.capture_ms is not None:

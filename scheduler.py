@@ -302,7 +302,15 @@ class HybridScheduler:
                                 c.sdr.dwell_offset_max_bw_hz)
         center_hz = float(target["center"]) + off
         iq = self.be.capture_iq(center_hz, c.sdr.dwell_rate_hz, c.sdr.dwell_samples)
-        m = dsp.measure_signal(iq, c.sdr.dwell_rate_hz, center_hz)
+        # DC残留ガード（既定0=無効）: >0 のときだけ中心±dc_guard_hz を主役候補から除外
+        #   するガード版で測る。0 のときは従来どおり seam の measure_signal を呼ぶ
+        #   （既定挙動を1ビットも変えない）。center_hz はオフセット適用後の実チューナ
+        #   中心なので、ガードの基準もその中心（offset併用時も整合）。
+        if c.sdr.dc_guard_hz > 0:
+            m = dsp.measure_signal_dc_guarded(iq, c.sdr.dwell_rate_hz, center_hz,
+                                              c.sdr.dc_guard_hz)
+        else:
+            m = dsp.measure_signal(iq, c.sdr.dwell_rate_hz, center_hz)
 
         # 検出帯はサーベイ側の帯域幅/SNRを信頼（信号がIBWより広い場合に重要）
         if target.get("src") == "detected":
@@ -404,7 +412,8 @@ class HybridScheduler:
                 t.get("bw"), c.sdr.dwell_offset_hz, c.sdr.dwell_offset_max_bw_hz)
             obs = dwell.observe_dwell(
                 self.be, f_tune, c.sdr.dwell_rate_hz, c.sdr.dwell_samples,
-                c.dwell, c.quality, target_src=t.get("src", ""))
+                c.dwell, c.quality, target_src=t.get("src", ""),
+                dc_guard_hz=c.sdr.dc_guard_hz)
             observed.append((t, obs))
 
         # 「極細」判定に使う帯域幅: 検出帯はサーベイ実測(detect_segments)が堅牢。
@@ -512,6 +521,10 @@ class HybridScheduler:
         sc = self.cfg.scan
         self._run_start = self._time_fn()      # 経過時間(max_minutes)の基準時刻
         self._stop_reason = None
+        # DC残留ガードが有効なときのみ1行告知（既定0=無効では何も出さない＝現行出力と完全一致）。
+        if verbose and self.cfg.sdr.dc_guard_hz > 0:
+            print(f"DC残留ガード: 中心±{self.cfg.sdr.dc_guard_hz/1e6:g}MHz を"
+                  f"検出候補から除外（dwell 測定のみ・チューナ相対）")
         try:
             while True:
                 if time.time() - self._last_survey >= sc.survey_interval_s:
