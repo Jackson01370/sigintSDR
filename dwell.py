@@ -65,7 +65,8 @@ class DwellObservation:
 
 def observe_dwell(backend, center_hz: float, rate: float, n_samples: int,
                   dcfg, qcfg, target_src: str = "", noise_floor_db=None,
-                  time_fn=time.time, sleep_fn=time.sleep) -> DwellObservation:
+                  time_fn=time.time, sleep_fn=time.sleep,
+                  dc_guard_hz: float = 0.0) -> DwellObservation:
     """1対象帯に dcfg.dwell_seconds 留まり、反復観測して統計を集計する。
 
     観測は obs_interval_s 間隔で行い、最低 min_observations 回・最大
@@ -75,6 +76,9 @@ def observe_dwell(backend, center_hz: float, rate: float, n_samples: int,
     noise_floor_db: 受信機ノイズ床の絶対基準(dB, measure_signal の peak_db スケール)。
         None なら滞在中の最小 peak_db を基準に自己推定する。
     time_fn / sleep_fn はテストから差し替え可能（実時間に依存せず回せる）。
+    dc_guard_hz: DC残留ガード（既定 0=無効＝従来どおり measure_signal を呼ぶ）。>0 で
+        各観測の測定を dsp.measure_signal_dc_guarded に切り替え、チューナ中心±dc_guard_hz を
+        主役候補から除外する（seam の measure_signal はシグネチャ不変のまま）。
     生IQ は代表分のみ保持する（全観測を抱えるとメモリを食うため）。
     """
     deadline = time_fn() + max(0.0, float(dcfg.dwell_seconds))
@@ -86,7 +90,12 @@ def observe_dwell(backend, center_hz: float, rate: float, n_samples: int,
     # --- 収集フェーズ: 反復観測して測定値を貯める ---
     while True:
         iq = backend.capture_iq(center_hz, rate, n_samples)
-        m = dsp.measure_signal(iq, rate, center_hz)
+        # DC残留ガード（既定0=無効）: >0 のときだけガード版へ。0 のときは従来どおり
+        #   seam の measure_signal を素通りで呼ぶ（既定挙動を1ビットも変えない）。
+        if dc_guard_hz > 0:
+            m = dsp.measure_signal_dc_guarded(iq, rate, center_hz, dc_guard_hz)
+        else:
+            m = dsp.measure_signal(iq, rate, center_hz)
         # DCスパイク指標: 中央(DC)が両脇よりどれだけ突出して細いか(dB)。
         #   観測ごとに測り、後段で平均(中央集中)と std(時間不変性)を取る。
         dcm = dsp.dc_spike_metrics(iq, rate, dc_band_hz=qcfg.dc_band_hz,

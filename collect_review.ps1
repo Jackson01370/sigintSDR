@@ -21,10 +21,29 @@
 .PARAMETER NoQualityGate   品質ゲート無効化（スプリアス収集用スイッチ）。
 .PARAMETER Out         出力ディレクトリ（既定 bench/<Tag>/）。
 .PARAMETER NoHeadless  ステップ4を常に (B) 待機フォールバックにする（claude -p を使わない）。
+.PARAMETER MaxMinutes  収集の時間上限分 → --max-minutes（未知帯域の安全装置。保存0件でも止まる）。任意。
+.PARAMETER DcGuardHz   DC残留ガードHz → --dc-guard-hz（1GHz以下で必須。中心±HzをDC残留として候補外に）。任意。
+.PARAMETER Lna         LNAゲイン → --lna。任意。
+.PARAMETER Vga         VGAゲイン → --vga。任意。
+.PARAMETER QNarrowBw   極細スプリアス上限Hz → --q-narrow-bw（放送帯の細い連続信号対策）。任意。
+.PARAMETER DwellOffsetHz チューナオフセットHz → --dwell-offset-hz（獲物をDC位置から避ける）。任意。
+.PARAMETER NoSuggest   ステップ3・4・4.5（CC視覚分類）を飛ばし、ステップ5を --suggest なしで実行する。
+                       CC分類の判断軸(review_suggest --auto-classify)は 2.4GHz 専用
+                       (ble-adv/wifi/spurious/hopping)で、1GHz以下は全件 unclear になるため。
 .PARAMETER DryRun      実行せずコマンド列だけ表示する（-WhatIf 相当のドライラン）。
 
+  ※ Part A の数値パラメータ（MaxMinutes/DcGuardHz/Lna/Vga/QNarrowBw/DwellOffsetHz）は
+    全て任意で、未指定ならステップ1に該当フラグを一切付けない（＝既定で現状と完全一致）。
+    ステップ1（収集）にのみ渡す（他ステップには影響しない）。
+
 .EXAMPLE
-  .\collect_review.ps1 -Tag wifi_aug2 -Start 2.408e9 -Stop 2.416e9 -Max 40
+  # 2.4GHz ISM（従来どおり・変更なし）
+  .\collect_review.ps1 -Tag mixed_24 -Start 2.4e9 -Stop 2.483e9 -Max 30 -Dwell 10
+
+.EXAMPLE
+  # 1GHz以下（FM放送）: LNAは物理的に外すこと。CC分類はスキップ。
+  .\collect_review.ps1 -Tag fm_a -Start 80e6 -Stop 90e6 -Max 10 -Dwell 5 `
+    -MaxMinutes 3 -DcGuardHz 500000 -Lna 32 -Vga 20 -QNarrowBw 100000 -NoSuggest
 
 .NOTES
   $py はスクリプト内で既定フルパスを設定（環境変数 SIGSCAN_PY で上書き可）。
@@ -41,6 +60,16 @@ param(
   [switch]$NoQualityGate,
   [string]$Out = "",
   [switch]$NoHeadless,
+  # Part A: 1GHz以下向けの任意フラグ（Nullable[double] で「未指定($null)」と「0(明示)」を区別）。
+  #   未指定ならステップ1に該当フラグを付けない＝既定で現状と完全一致。
+  [Nullable[double]]$MaxMinutes = $null,
+  [Nullable[double]]$DcGuardHz = $null,
+  [Nullable[double]]$Lna = $null,
+  [Nullable[double]]$Vga = $null,
+  [Nullable[double]]$QNarrowBw = $null,
+  [Nullable[double]]$DwellOffsetHz = $null,
+  # Part B: CC視覚分類(ステップ3・4・4.5)を飛ばし、人間が直接ラベル入力する経路。
+  [switch]$NoSuggest,
   [switch]$DryRun
 )
 
@@ -67,6 +96,18 @@ $tasklist = "$Out/classify_tasklist.md"
 $gateArgs = @()
 if ($NoQualityGate) { $gateArgs = @("--no-quality-gate") }
 
+# Part A: 1GHz以下向けの追加フラグ（全て任意）。未指定($null)なら何も足さない＝既定で
+#   コマンド列が現状と1文字も変わらない。$null 判定なので -DcGuardHz 0 は「明示的に無効」
+#   として --dc-guard-hz 0 を渡す（未指定とは区別・main.py 側では 0=既定なので無害）。
+#   ステップ1（収集）にのみ渡す。
+$extraCollectArgs = @()
+if ($null -ne $MaxMinutes)    { $extraCollectArgs += @("--max-minutes", $MaxMinutes) }
+if ($null -ne $DcGuardHz)     { $extraCollectArgs += @("--dc-guard-hz", $DcGuardHz) }
+if ($null -ne $Lna)           { $extraCollectArgs += @("--lna", $Lna) }
+if ($null -ne $Vga)           { $extraCollectArgs += @("--vga", $Vga) }
+if ($null -ne $QNarrowBw)     { $extraCollectArgs += @("--q-narrow-bw", $QNarrowBw) }
+if ($null -ne $DwellOffsetHz) { $extraCollectArgs += @("--dwell-offset-hz", $DwellOffsetHz) }
+
 Write-Host "==========================================================================" -ForegroundColor Cyan
 Write-Host "  collect_review.ps1 : 収集〜確定ワンコマンド（オーケストレーションのみ）" -ForegroundColor Cyan
 Write-Host "  Tag=$Tag  範囲=$Start-$Stop Hz  Max=$Max  Dwell=$Dwell  Out=$Out" -ForegroundColor Cyan
@@ -82,12 +123,18 @@ function Show-Cmd([string]$label, [string[]]$cmd) {
 # ドライランなら5ステップのコマンド列を並べて終了（実行しない）
 if ($DryRun) {
   Write-Host "`n[DryRun] 実行はせず、流れるコマンド列を表示します:" -ForegroundColor Magenta
-  Show-Cmd "1. 収集" (@($py, "main.py", "--hardware", "--start", $Start, "--stop", $Stop, "--focus", "--dwell-seconds", $Dwell, "--q-min-persistence", $QMinPersistence) + $gateArgs + @("--max-records", $Max, "--tag", $Tag, "--collect", "captures/"))
+  Show-Cmd "1. 収集" (@($py, "main.py", "--hardware", "--start", $Start, "--stop", $Stop, "--focus", "--dwell-seconds", $Dwell, "--q-min-persistence", $QMinPersistence) + $gateArgs + $extraCollectArgs + @("--max-records", $Max, "--tag", $Tag, "--collect", "captures/"))
   Show-Cmd "2. 画像化" @($py, "view_captures.py", "captures/", "--pattern", "`"$pattern`"")
-  Show-Cmd "3. 提案生成" @($py, "-m", "cnntrain.review_suggest", "--data", "captures/", "--pattern", "`"$pattern`"", "--out", $Out, "--auto-classify")
-  $branch = if ($NoHeadless) { "(B) 待機フォールバック（-NoHeadless 指定）" } elseif (Get-Command claude -ErrorAction SilentlyContinue) { "(A) claude -p ヘッドレス自動（失敗時 B へ）" } else { "(B) 待機フォールバック（claude CLI 不在）" }
-  Write-Host "`n>>> 4. CC分類 → $branch" -ForegroundColor Yellow
-  Show-Cmd "5. 人間の○×（ここで人間が y/n を押す）" @($py, "review.py", "captures/", "--pattern", "`"$pattern`"", "--suggest", $suggestions, "--batch-confirm", "--open-sheet")
+  if ($NoSuggest) {
+    # -NoSuggest: CC視覚分類（3・4・4.5）を丸ごと飛ばし、ステップ5を --suggest なしで。
+    Write-Host "`n>>> 3-4.5 CC分類 → スキップ（-NoSuggest）。ラベルは人間が直接入力します。" -ForegroundColor Yellow
+    Show-Cmd "5. 人間の○×（ここで人間が y/n を押す）" @($py, "review.py", "captures/", "--pattern", "`"$pattern`"")
+  } else {
+    Show-Cmd "3. 提案生成" @($py, "-m", "cnntrain.review_suggest", "--data", "captures/", "--pattern", "`"$pattern`"", "--out", $Out, "--auto-classify")
+    $branch = if ($NoHeadless) { "(B) 待機フォールバック（-NoHeadless 指定）" } elseif (Get-Command claude -ErrorAction SilentlyContinue) { "(A) claude -p ヘッドレス自動（失敗時 B へ）" } else { "(B) 待機フォールバック（claude CLI 不在）" }
+    Write-Host "`n>>> 4. CC分類 → $branch" -ForegroundColor Yellow
+    Show-Cmd "5. 人間の○×（ここで人間が y/n を押す）" @($py, "review.py", "captures/", "--pattern", "`"$pattern`"", "--suggest", $suggestions, "--batch-confirm", "--open-sheet")
+  }
   Write-Host "`n[DryRun] 実際の収集・確定は行っていません。" -ForegroundColor Magenta
   exit 0
 }
@@ -95,7 +142,7 @@ if ($DryRun) {
 # =========================================================================
 # 1. 収集（--max-records で自動停止するまで待つ）
 # =========================================================================
-$collectArgs = @("main.py", "--hardware", "--start", $Start, "--stop", $Stop, "--focus", "--dwell-seconds", $Dwell, "--q-min-persistence", $QMinPersistence) + $gateArgs + @("--max-records", $Max, "--tag", $Tag, "--collect", "captures/")
+$collectArgs = @("main.py", "--hardware", "--start", $Start, "--stop", $Stop, "--focus", "--dwell-seconds", $Dwell, "--q-min-persistence", $QMinPersistence) + $gateArgs + $extraCollectArgs + @("--max-records", $Max, "--tag", $Tag, "--collect", "captures/")
 Show-Cmd "1. 収集" (@($py) + $collectArgs)
 & $py @collectArgs
 if ($LASTEXITCODE -ne 0) {
@@ -120,6 +167,17 @@ if ($LASTEXITCODE -ne 0) {
   Write-Host "エラー: 画像化(view_captures.py)が失敗しました（exit=$LASTEXITCODE）。中止します。" -ForegroundColor Red
   exit 1
 }
+
+# =========================================================================
+# 3・4・4.5. CC視覚分類ブロック（-NoSuggest なら丸ごとスキップ）
+#   CC分類の判断軸(review_suggest --auto-classify の指示文)は 2.4GHz 専用
+#   (ble-adv/wifi/spurious/hopping)で、1GHz以下は全件 unclear になり確定候補が0件に
+#   なる。よって -NoSuggest では 3・4・4.5 を飛ばし、人間が review.py で直接ラベル入力する。
+# =========================================================================
+if ($NoSuggest) {
+  Write-Host "`n>>> CC分類はスキップ（-NoSuggest）。ラベルは人間が review.py で直接入力します。" -ForegroundColor Yellow
+  if ($NoHeadless) { Write-Host "    （-NoHeadless は CC分類を伴わないため無視します）" -ForegroundColor DarkGray }
+} else {
 
 # =========================================================================
 # 3. 提案生成（--auto-classify で指示文ブロックも印字される）
@@ -177,15 +235,26 @@ if (-not (Test-Path $suggestions)) {
   exit 1
 }
 
+}   # ← -NoSuggest else ブロックの終端（CC視覚分類 3・4・4.5 をスキップ or 実行）
+
 # =========================================================================
 # 5. 人間の○×（ここで人間が y/n を押す。ラッパーは代行しない）
 # =========================================================================
-Show-Cmd "5. 人間の○×（人間が y/n を押す）" @($py, "review.py", "captures/", "--pattern", "`"$pattern`"", "--suggest", $suggestions, "--batch-confirm", "--open-sheet")
-Write-Host "    ↓ ここから先は人間の確定操作です（AI は代行しません）。" -ForegroundColor Green
-# --open-sheet: 対話の人間○×なので全 PNG を1枚のコンタクトシートにまとめて自動で開く
-#   （表示補助のみ・確定は人間）。ヘッドレスのステップ4-A(claude -p)は review.py を
-#   呼ばないためシートは付かない（GUI 不要）。
-& $py review.py captures/ --pattern "$pattern" --suggest $suggestions --batch-confirm --open-sheet
+if ($NoSuggest) {
+  # -NoSuggest: --suggest/--batch-confirm/--open-sheet は付けない（--suggest 併用時のみ
+  #   有効なので、単独で付けると警告になる）。人間が review.py のラベル一覧から番号を
+  #   直接入力して確定する（ラッパーは代行しない）。
+  Show-Cmd "5. 人間の○×（人間が y/n を押す）" @($py, "review.py", "captures/", "--pattern", "`"$pattern`"")
+  Write-Host "    ↓ ここから先は人間の確定操作です（AI は代行しません）。" -ForegroundColor Green
+  & $py review.py captures/ --pattern "$pattern"
+} else {
+  Show-Cmd "5. 人間の○×（人間が y/n を押す）" @($py, "review.py", "captures/", "--pattern", "`"$pattern`"", "--suggest", $suggestions, "--batch-confirm", "--open-sheet")
+  Write-Host "    ↓ ここから先は人間の確定操作です（AI は代行しません）。" -ForegroundColor Green
+  # --open-sheet: 対話の人間○×なので全 PNG を1枚のコンタクトシートにまとめて自動で開く
+  #   （表示補助のみ・確定は人間）。ヘッドレスのステップ4-A(claude -p)は review.py を
+  #   呼ばないためシートは付かない（GUI 不要）。
+  & $py review.py captures/ --pattern "$pattern" --suggest $suggestions --batch-confirm --open-sheet
+}
 
 # =========================================================================
 # 終了サマリ
@@ -194,6 +263,12 @@ Write-Host "`n==================================================================
 Write-Host "  完了サマリ" -ForegroundColor Cyan
 Write-Host "  バッチタグ : $Tag（--pattern `"$pattern`" で再選択可）" -ForegroundColor Cyan
 Write-Host "  収集件数   : $collected 件" -ForegroundColor Cyan
-Write-Host "  出力先     : $Out（suggestions.csv / confirm_sheet.md / classify_tasklist.md）" -ForegroundColor Cyan
-Write-Host "  確定       : 人間が review.py --batch-confirm で実施（AI は代行していない）" -ForegroundColor Cyan
+if ($NoSuggest) {
+  # -NoSuggest では bench/<Tag> は作られないため、存在しないパスを出力先として案内しない。
+  Write-Host "  出力先     : captures/（PNG。bench/ は -NoSuggest では未使用）" -ForegroundColor Cyan
+  Write-Host "  確定       : 人間が review.py でラベルを直接入力（--suggest なし・AI は代行していない）" -ForegroundColor Cyan
+} else {
+  Write-Host "  出力先     : $Out（suggestions.csv / confirm_sheet.md / classify_tasklist.md）" -ForegroundColor Cyan
+  Write-Host "  確定       : 人間が review.py --batch-confirm で実施（AI は代行していない）" -ForegroundColor Cyan
+}
 Write-Host "==========================================================================" -ForegroundColor Cyan
